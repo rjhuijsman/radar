@@ -1,6 +1,7 @@
 #include "Display.h"
 
 #include <Wire.h>
+#include <esp_heap_caps.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
 
@@ -13,62 +14,29 @@ namespace {
 // controller and as the backlight control line.
 Arduino_XCA9554SWSPI* g_expander = nullptr;
 
-// The ESP32-S3 RGB LCD peripheral, driven directly so we can allocate TWO
-// framebuffers and flip between them; Arduino_RGB_Display hardcodes one.
+// The ESP32-S3 RGB LCD peripheral, driven directly so we can run with a
+// single PSRAM framebuffer that the renderer updates in place.
 esp_lcd_panel_handle_t g_panel = nullptr;
 
-// The render task (core-1 loop) that flush() blocks on, notified from the
-// panel's frame-complete ISR.
+// The render task (core-1 loop) that LiveGfx::flush() blocks on, notified
+// from the panel's VSYNC ISR so the loop paces to the panel refresh.
 volatile TaskHandle_t g_renderTask = nullptr;
 
-// Fires from the RGB driver ISR once a whole framebuffer has finished scanning
-// out and the panel has switched away from the previous one — i.e. the buffer
-// we flipped away from is now free to draw into again.
-bool IRAM_ATTR onFrameBufComplete(esp_lcd_panel_handle_t,
-                                  const esp_lcd_rgb_panel_event_data_t*, void*) {
+// The live surface (aimed at the scanned framebuffer) and the off-screen
+// static-reference surface, plus their raw framebuffers.
+LiveGfx* g_live = nullptr;
+StaticGfx* g_static = nullptr;
+uint16_t* g_liveFb = nullptr;
+uint16_t* g_staticFb = nullptr;
+
+// Fires from the RGB driver ISR at each VSYNC. Waking the render task here
+// paces one rendered frame per panel refresh (~24.6 Hz) with no busy-wait.
+bool IRAM_ATTR onVsync(esp_lcd_panel_handle_t,
+                       const esp_lcd_rgb_panel_event_data_t*, void*) {
   BaseType_t woken = pdFALSE;
   if (g_renderTask) vTaskNotifyGiveFromISR(g_renderTask, &woken);
   return woken == pdTRUE;
 }
-
-// Draws through Arduino_Canvas's software rasteriser, but aims its framebuffer
-// at one of the panel's two hardware framebuffers (zero per-frame copy).
-// flush() presents the finished buffer, then BLOCKS until the panel has
-// switched away from the previous buffer before letting the next frame reuse
-// it. That wait is essential: esp_lcd_panel_draw_bitmap() only sets the target
-// index — the DMA keeps scanning the OLD buffer until end-of-frame, so drawing
-// into it immediately (our per-frame fillScreen) is what caused the full-screen
-// blink. The wait also paces rendering to the panel refresh (~24.6 Hz).
-class DoubleBufferGfx : public Arduino_Canvas {
- public:
-  DoubleBufferGfx(int16_t w, int16_t h, esp_lcd_panel_handle_t panel,
-                  uint16_t* fb0, uint16_t* fb1)
-      : Arduino_Canvas(w, h, nullptr), _panel(panel) {
-    _fb[0] = fb0;
-    _fb[1] = fb1;
-    _framebuffer = _fb[_cur];  // Draw into the back buffer.
-  }
-
-  // The panel and framebuffers already exist; nothing to allocate.
-  bool begin(int32_t = GFX_NOT_DEFINED) override { return true; }
-
-  void flush(bool = false) override {
-    ulTaskNotifyTake(pdTRUE, 0);  // Drop any stale completion notification.
-    esp_lcd_panel_draw_bitmap(_panel, 0, 0, _width, _height, _framebuffer);
-    // Wait until the panel has switched away from the previous buffer (100 ms
-    // is a safety cap — at 24.6 Hz a frame is ~41 ms).
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
-    _cur ^= 1;
-    _framebuffer = _fb[_cur];  // Next frame targets the now-free buffer.
-  }
-
- private:
-  esp_lcd_panel_handle_t _panel;
-  uint16_t* _fb[2];
-  uint8_t _cur = 0;
-};
-
-DoubleBufferGfx* g_gfx = nullptr;
 
 }  // namespace
 
@@ -91,8 +59,11 @@ Arduino_GFX* begin() {
   g_expander->batchOperation((uint8_t*)hd40015c40_init_operations,
                              sizeof(hd40015c40_init_operations));
 
-  // Two framebuffers in PSRAM (for the vsync flip) plus a bounce buffer so the
-  // LCD FIFO refills from internal SRAM and cannot underrun when PSRAM is busy.
+  // A SINGLE framebuffer in PSRAM (no flip) plus a bounce buffer so the LCD
+  // FIFO refills from internal SRAM and cannot underrun when PSRAM is busy.
+  // This is IDF's stable "bounce buffer with single PSRAM frame buffer" mode:
+  // the CPU refills the bounce buffer from the PSRAM framebuffer, so the CPU
+  // writes we make into that framebuffer stay cache-coherent with scan-out.
   // Timings are the 4" round panel's; the pixel clock is its 16 MHz spec (the
   // library default of 12 MHz refreshes at a flickery ~18 Hz). Data-pin order
   // mirrors Arduino_ESP32RGBPanel. 720*720 is divisible by the bounce size.
@@ -120,7 +91,7 @@ Arduino_GFX* begin() {
           },
       .data_width = 16,
       .bits_per_pixel = 16,
-      .num_fbs = 2,
+      .num_fbs = 1,
       .bounce_buffer_size_px = (size_t)(config::PANEL_WIDTH * 20),
       .sram_trans_align = 8,
       .psram_trans_align = 64,
@@ -143,7 +114,7 @@ Arduino_GFX* begin() {
               .disp_active_low = 1,
               .refresh_on_demand = 0,
               .fb_in_psram = 1,
-              .double_fb = 0,  // num_fbs = 2 already asks for two buffers.
+              .double_fb = 0,
               .no_fb = 0,
               .bb_invalidate_cache = 0,
           },
@@ -154,37 +125,53 @@ Arduino_GFX* begin() {
     return nullptr;
   }
 
-  // Register the frame-complete callback BEFORE init (per the IDF driver), so
-  // flush() can block until the panel finishes switching framebuffers.
+  // Register the VSYNC callback BEFORE init (per the IDF driver), so flush()
+  // can pace the render loop to the panel refresh.
   esp_lcd_rgb_panel_event_callbacks_t cbs = {};
-  cbs.on_frame_buf_complete = onFrameBufComplete;
+  cbs.on_vsync = onVsync;
   esp_lcd_rgb_panel_register_event_callbacks(g_panel, &cbs, nullptr);
 
   esp_lcd_panel_reset(g_panel);
   esp_lcd_panel_init(g_panel);
 
   void* fb0 = nullptr;
-  void* fb1 = nullptr;
-  if (esp_lcd_rgb_panel_get_frame_buffer(g_panel, 2, &fb0, &fb1) != ESP_OK) {
-    Serial.println("[display] get_frame_buffer(2) failed.");
+  if (esp_lcd_rgb_panel_get_frame_buffer(g_panel, 1, &fb0) != ESP_OK) {
+    Serial.println("[display] get_frame_buffer(1) failed.");
+    return nullptr;
+  }
+  g_liveFb = static_cast<uint16_t*>(fb0);
+
+  // The static-reference framebuffer is a second full-panel buffer in PSRAM.
+  // The renderer paints the unchanging scene into it and copies sub-regions
+  // back into the live buffer to erase moving elements.
+  size_t fbSize = (size_t)config::PANEL_WIDTH * config::PANEL_HEIGHT * 2;
+  g_staticFb = static_cast<uint16_t*>(
+      heap_caps_aligned_alloc(16, fbSize, MALLOC_CAP_SPIRAM));
+  if (g_staticFb == nullptr) {
+    Serial.println("[display] static framebuffer alloc failed.");
     return nullptr;
   }
 
-  g_gfx = new DoubleBufferGfx(config::PANEL_WIDTH, config::PANEL_HEIGHT, g_panel,
-                              static_cast<uint16_t*>(fb0),
-                              static_cast<uint16_t*>(fb1));
-  Serial.printf("[display] panel up: %dx%d, double-buffered, vsync-paced.\n",
-                config::PANEL_WIDTH, config::PANEL_HEIGHT);
+  g_live = new LiveGfx(config::PANEL_WIDTH, config::PANEL_HEIGHT, g_liveFb);
+  g_static = new StaticGfx(config::PANEL_WIDTH, config::PANEL_HEIGHT, g_staticFb);
+  Serial.printf(
+      "[display] panel up: %dx%d, single-fb, dirty-rect, vsync-paced.\n",
+      config::PANEL_WIDTH, config::PANEL_HEIGHT);
 
-  // Clear both framebuffers before the backlight comes on.
-  g_gfx->fillScreen(RGB565_BLACK);
-  g_gfx->flush();
-  g_gfx->fillScreen(RGB565_BLACK);
-  g_gfx->flush();
+  // Clear the scanned buffer before the backlight comes on. There is no flip:
+  // these writes are what the panel shows.
+  g_live->fillScreen(RGB565_BLACK);
 
   setBacklight(true);
-  return g_gfx;
+  return g_live;
 }
+
+LiveGfx* live() { return g_live; }
+Arduino_GFX* staticRef() { return g_static; }
+uint16_t* liveFb() { return g_liveFb; }
+uint16_t* staticFb() { return g_staticFb; }
+int16_t width() { return config::PANEL_WIDTH; }
+int16_t height() { return config::PANEL_HEIGHT; }
 
 void setBacklight(bool on) {
   if (g_expander == nullptr) {

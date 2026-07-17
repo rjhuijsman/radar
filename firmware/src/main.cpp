@@ -109,6 +109,11 @@ void setup() {
   g_gfx = display::begin();
   Serial.printf("[radar] display: %s\n",
                 g_gfx ? "up" : "FAILED (gfx=null, rendering disabled)");
+  if (g_gfx != nullptr) {
+    radar::beginRenderer(display::live(), display::staticRef(),
+                         display::liveFb(), display::staticFb(),
+                         display::width(), display::height());
+  }
   seedDefaultHomeIfEmpty();
 
   // Every boot (cold or wake-from-sleep) opens with the power-on bloom.
@@ -140,6 +145,9 @@ void loop() {
     if (radar::renderTransition(g_gfx, g_model, animProgress, true)) {
       g_model.ui.screen = model::Screen::On;
       animProgress = 0;
+      // The transition left arbitrary content in the live buffer; make the
+      // first steady-state frame rebuild the reference and repaint in full.
+      radar::invalidate();
     }
   } else if (screen == model::Screen::PoweringOff) {
     animProgress += static_cast<float>(dt) / 720.0f;
@@ -152,8 +160,8 @@ void loop() {
     return;
   } else {
     radar::step(g_model, dt);
-    radar::renderScene(g_gfx, g_model);
+    radar::renderIncremental(g_model);
   }
   xSemaphoreGive(g_mutex);
-  g_gfx->flush();  // Present the finished frame to the panel.
+  g_gfx->flush();  // Block until the next vsync to pace the render loop.
 }

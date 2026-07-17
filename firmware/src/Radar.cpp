@@ -1,7 +1,11 @@
 #include "Radar.h"
 
 #include <math.h>
+#include <string.h>
 
+#include <vector>
+
+#include "Display.h"
 #include "config.h"
 
 namespace radar {
@@ -168,27 +172,30 @@ void drawHomeMarker(Arduino_GFX* gfx, const Model& model) {
   gfx->fillCircle(x, y, 3, c);
 }
 
+void drawPoi(Arduino_GFX* gfx, const Model& model, const model::Poi& poi) {
+  float x, y;
+  project(model, poi.pos, x, y);
+  uint16_t c = dim(C_CYAN, model.ui.brightness);
+  if (poi.isAirport) {
+    gfx->drawCircle(x, y, 9, c);
+    for (float heading : poi.runwayHeadings) {
+      float a = (heading - 90) * DEG_TO_RAD;
+      gfx->drawLine(x - cosf(a) * 7, y - sinf(a) * 7, x + cosf(a) * 7,
+                    y + sinf(a) * 7, c);
+    }
+  } else {
+    gfx->drawLine(x, y - 6, x + 6, y, c);
+    gfx->drawLine(x + 6, y, x, y + 6, c);
+    gfx->drawLine(x, y + 6, x - 6, y, c);
+    gfx->drawLine(x - 6, y, x, y - 6, c);
+  }
+  drawLabel(gfx, x - 12, y + 14, poi.name, c);
+}
+
 void drawAirportsAndPois(Arduino_GFX* gfx, const Model& model) {
-  float k = model.ui.brightness;
   for (const auto& poi : model.pois) {
     if (distanceFrom(model, poi.pos) > model.ui.range) continue;
-    float x, y;
-    project(model, poi.pos, x, y);
-    uint16_t c = dim(C_CYAN, k);
-    if (poi.isAirport) {
-      gfx->drawCircle(x, y, 9, c);
-      for (float heading : poi.runwayHeadings) {
-        float a = (heading - 90) * DEG_TO_RAD;
-        gfx->drawLine(x - cosf(a) * 7, y - sinf(a) * 7, x + cosf(a) * 7,
-                      y + sinf(a) * 7, c);
-      }
-    } else {
-      gfx->drawLine(x, y - 6, x + 6, y, c);
-      gfx->drawLine(x + 6, y, x, y + 6, c);
-      gfx->drawLine(x, y + 6, x - 6, y, c);
-      gfx->drawLine(x - 6, y, x, y - 6, c);
-    }
-    drawLabel(gfx, x - 12, y + 14, poi.name, c);
+    drawPoi(gfx, model, poi);
   }
 }
 
@@ -297,7 +304,224 @@ void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model) {
   gfx->print(msg);
 }
 
+// ---- Incremental (dirty-rect) renderer. ----
+//
+// The static reference holds the unchanging scene (background, rings, weather,
+// geography). Each frame we erase the previous positions of the moving
+// elements by copying those regions back from the reference, then redraw the
+// elements at their new positions. Erasing every old box before drawing any
+// new one keeps overlapping elements correct.
+
+display::LiveGfx* g_live = nullptr;  // Live surface (the scanned framebuffer).
+Arduino_GFX* g_static = nullptr;     // Off-screen static-reference surface.
+uint16_t* g_liveFb = nullptr;
+uint16_t* g_staticFb = nullptr;
+int g_w = 0, g_h = 0;
+
+bool g_needStatic = true;  // Rebuild the static reference before the next frame.
+bool g_needFull = true;    // Repaint the whole live buffer before the next frame.
+
+// Fingerprint of everything the static reference depends on. When it changes,
+// the reference is rebuilt and the live buffer is fully repainted from it.
+struct StaticSig {
+  int32_t range100 = 0;  // Range in NM * 100 (ring labels, projection scale).
+  int16_t cx = 0, cy = 0;  // View center in pixels (weather/geography shift).
+  uint8_t mode = 0;        // Display mode (weather layer on/off).
+  uint8_t geo = 0;         // Geography overlay on/off.
+  int16_t bright = 0;      // Brightness * 64 (ambient dimming of static colors).
+};
+StaticSig g_sig;
+
+struct Rect {
+  int16_t x, y, w, h;
+};
+std::vector<Rect> g_prevRects;  // Moving-element boxes drawn last frame.
+std::vector<Rect> g_curRects;   // Moving-element boxes drawn this frame.
+
+// Previous sweep line endpoint; its start is always the panel center.
+int16_t g_prevSweepX = 0, g_prevSweepY = 0;
+int16_t g_curSweepX = 0, g_curSweepY = 0;
+bool g_haveSweep = false;
+
+bool sigEqual(const StaticSig& a, const StaticSig& b) {
+  return a.range100 == b.range100 && a.cx == b.cx && a.cy == b.cy &&
+         a.mode == b.mode && a.geo == b.geo && a.bright == b.bright;
+}
+
+StaticSig staticSigOf(const Model& model) {
+  float ppn = pixelsPerNm(model);
+  StaticSig s;
+  s.range100 = static_cast<int32_t>(lroundf(model.ui.range * 100.0f));
+  s.cx = static_cast<int16_t>(lroundf(model.ui.viewCenter.x * ppn));
+  s.cy = static_cast<int16_t>(lroundf(model.ui.viewCenter.y * ppn));
+  s.mode = static_cast<uint8_t>(model.ui.display);
+  s.geo = model.ui.geography ? 1 : 0;
+  s.bright = static_cast<int16_t>(lroundf(model.ui.brightness * 64.0f));
+  return s;
+}
+
+// Copies a clamped rectangle from the static reference into the live buffer,
+// restoring the static scene under a moving element that is about to shift.
+void restoreRect(const Rect& r) {
+  int x0 = r.x < 0 ? 0 : r.x;
+  int y0 = r.y < 0 ? 0 : r.y;
+  int x1 = r.x + r.w;
+  int y1 = r.y + r.h;
+  if (x1 > g_w) x1 = g_w;
+  if (y1 > g_h) y1 = g_h;
+  if (x0 >= x1 || y0 >= y1) return;
+  size_t bytes = static_cast<size_t>(x1 - x0) * 2;
+  for (int y = y0; y < y1; ++y) {
+    size_t off = static_cast<size_t>(y) * g_w + x0;
+    memcpy(g_liveFb + off, g_staticFb + off, bytes);
+  }
+}
+
+void restorePixel(int x, int y) {
+  if (x < 0 || x >= g_w || y < 0 || y >= g_h) return;
+  size_t off = static_cast<size_t>(y) * g_w + x;
+  g_liveFb[off] = g_staticFb[off];
+}
+
+// Restores the static pixels under the previous sweep line, with a 3x3 brush
+// so a one-pixel rasteriser difference cannot leave a glowing trail behind.
+void restoreSweep(int x1, int y1) {
+  int x0 = static_cast<int>(kCenterX);
+  int y0 = static_cast<int>(kCenterY);
+  int dx = x1 - x0;
+  if (dx < 0) dx = -dx;
+  int dy = y1 - y0;
+  if (dy < 0) dy = -dy;
+  dy = -dy;
+  int sx = x0 < x1 ? 1 : -1;
+  int sy = y0 < y1 ? 1 : -1;
+  int err = dx + dy;
+  for (;;) {
+    for (int by = -1; by <= 1; ++by) {
+      for (int bx = -1; bx <= 1; ++bx) restorePixel(x0 + bx, y0 + by);
+    }
+    if (x0 == x1 && y0 == y1) break;
+    int e2 = 2 * err;
+    if (e2 >= dy) {
+      err += dy;
+      x0 += sx;
+    }
+    if (e2 <= dx) {
+      err += dx;
+      y0 += sy;
+    }
+  }
+}
+
+void restoreAll() {
+  memcpy(g_liveFb, g_staticFb, static_cast<size_t>(g_w) * g_h * 2);
+}
+
+// Paints the unchanging scene into the static-reference surface.
+void renderStatic(Model& model) {
+  drawBackground(g_static, model);
+  if (showWeather(model)) drawWeather(g_static, model);
+  if (model.ui.geography) drawGeography(g_static, model);
+}
+
+// Records the bounding box of the element just drawn into the live surface so
+// it can be erased next frame. Empty draws (off-screen elements) add nothing.
+void endTrackPush() {
+  int16_t x, y, w, h;
+  if (g_live->endTrack(x, y, w, h)) g_curRects.push_back(Rect{x, y, w, h});
+}
+
+// Draws every moving element into the live surface, recording each one's box.
+// Order matches the original scene so the composite z-order is unchanged: the
+// sweep sits under the markers, which sit under the aircraft and overlay.
+void drawDynamic(Model& model) {
+  drawSweep(g_live, model);
+  float sx, sy;
+  polar(model.ui.sweepAngle, kRadius, sx, sy);
+  g_curSweepX = static_cast<int16_t>(sx);
+  g_curSweepY = static_cast<int16_t>(sy);
+
+  g_live->beginTrack();
+  drawHomeMarker(g_live, model);
+  endTrackPush();
+
+  if (showFlights(model)) {
+    for (const auto& poi : model.pois) {
+      if (distanceFrom(model, poi.pos) > model.ui.range) continue;
+      g_live->beginTrack();
+      drawPoi(g_live, model, poi);
+      endTrackPush();
+    }
+    for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
+      g_live->beginTrack();
+      drawAircraft(g_live, model, model.aircraft[i], i);
+      endTrackPush();
+    }
+  }
+
+  if (!model.ui.online) {
+    g_live->beginTrack();
+    drawAcquiringSignal(g_live, model);
+    endTrackPush();
+  }
+}
+
 }  // namespace
+
+void beginRenderer(display::LiveGfx* live, Arduino_GFX* staticRef,
+                   uint16_t* liveFb, uint16_t* staticFb, int16_t width,
+                   int16_t height) {
+  g_live = live;
+  g_static = staticRef;
+  g_liveFb = liveFb;
+  g_staticFb = staticFb;
+  g_w = width;
+  g_h = height;
+  invalidate();
+}
+
+void invalidate() {
+  g_needStatic = true;
+  g_needFull = true;
+  g_haveSweep = false;
+  g_prevRects.clear();
+}
+
+void renderIncremental(Model& model) {
+  // Rebuild the static reference when the view, range, mode, geography or
+  // brightness changed; that also forces one full repaint of the live buffer.
+  StaticSig sig = staticSigOf(model);
+  if (g_needStatic || !sigEqual(sig, g_sig)) {
+    renderStatic(model);
+    g_sig = sig;
+    g_needStatic = false;
+    g_needFull = true;
+  }
+
+  if (g_needFull) {
+    restoreAll();  // Establish a known live buffer from the reference.
+    g_curRects.clear();
+    drawDynamic(model);
+    g_prevRects.swap(g_curRects);
+    g_prevSweepX = g_curSweepX;
+    g_prevSweepY = g_curSweepY;
+    g_haveSweep = true;
+    g_needFull = false;
+    return;
+  }
+
+  // Erase everything drawn last frame, then redraw at the new positions.
+  if (g_haveSweep) restoreSweep(g_prevSweepX, g_prevSweepY);
+  for (const auto& r : g_prevRects) restoreRect(r);
+
+  g_curRects.clear();
+  drawDynamic(model);
+
+  g_prevRects.swap(g_curRects);
+  g_prevSweepX = g_curSweepX;
+  g_prevSweepY = g_curSweepY;
+  g_haveSweep = true;
+}
 
 void step(Model& model, uint32_t dtMs) {
   float dt = static_cast<float>(dtMs);
