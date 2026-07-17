@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <WiFi.h>
 #include <WiFiClientSecure.h>
 
 #include <math.h>
@@ -52,6 +53,11 @@ model::Vec geoToWorld(const model::Home& home, float lat, float lon) {
 }
 
 bool httpGet(const String& url, String& body) {
+  // Skip the blocking request when Wi-Fi is down. The network task calls this
+  // while holding the model mutex, so a hung connect would stall the render
+  // loop for seconds each poll (the "drops to ~1 fps once the portal exits"
+  // bug); feeds also cannot work without a connection.
+  if (!WiFi.isConnected()) return false;
   WiFiClientSecure client;
   // TODO(security): install a CA bundle and validate certificates instead
   // of trusting any peer.
