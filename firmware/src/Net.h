@@ -20,4 +20,7 @@ bool begin(model::Model& model, SemaphoreHandle_t mutex);
 // update is picked up promptly.
 void loopOta();
 
+// True while the station is associated with an access point.
+bool online();
+
 }  // namespace net

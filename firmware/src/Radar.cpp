@@ -277,6 +277,26 @@ void drawWeather(Arduino_GFX* gfx, const Model& model) {
   }
 }
 
+// Shown until Wi-Fi associates: "ACQUIRING SIGNAL" over the center, pulsing
+// in and out, while the scope keeps sweeping behind it.
+void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model) {
+  float k = model.ui.brightness;
+  // Gentle brightness pulse, floored so the amber never darkens toward black —
+  // fully dimming would punch dark holes in the phosphor graphics it sits over.
+  float pulse = 0.68f + 0.32f * sinf(millis() / 360.0f);
+  uint16_t c = dim(C_AMBER, k * pulse);
+
+  const char* msg = "ACQUIRING SIGNAL";
+  const int len = 16;
+  const int size = 3;
+  const int charW = 6 * size, charH = 8 * size;
+  gfx->setTextSize(size);
+  gfx->setTextColor(c);
+  gfx->setCursor(static_cast<int>(kCenterX) - (len * charW) / 2,
+                 static_cast<int>(kCenterY) - charH / 2);
+  gfx->print(msg);
+}
+
 }  // namespace
 
 void step(Model& model, uint32_t dtMs) {
@@ -288,10 +308,12 @@ void step(Model& model, uint32_t dtMs) {
   model.ui.viewCenter.x += (target.x - model.ui.viewCenter.x) * kEase;
   model.ui.viewCenter.y += (target.y - model.ui.viewCenter.y) * kEase;
 
-  // Advance the sweep and refresh whatever it crossed.
+  // Advance the sweep and refresh whatever it crossed. Derive the angle from
+  // absolute time rather than accumulating frame deltas, so frame-timing jitter
+  // never makes the sweep step unevenly or appear to jump back and forth.
   float previous = model.ui.sweepAngle;
-  model.ui.sweepAngle = fmodf(
-      model.ui.sweepAngle + dt * 360.0f / config::SWEEP_PERIOD_MS, 360.0f);
+  uint32_t period = config::SWEEP_PERIOD_MS;
+  model.ui.sweepAngle = (millis() % period) * 360.0f / period;
   float decay = expf(-dt / kSweepPersistenceMs);
 
   for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
@@ -317,11 +339,12 @@ void renderScene(Arduino_GFX* gfx, Model& model) {
       drawAircraft(gfx, model, model.aircraft[i], i);
     }
   }
+  if (!model.ui.online) drawAcquiringSignal(gfx, model);
 }
 
 bool renderTransition(Arduino_GFX* gfx, Model& model, float progress,
                       bool poweringOn) {
-  gfx->fillScreen(BLACK);
+  gfx->fillScreen(RGB565_BLACK);
   float p = min(1.0f, progress);
   uint16_t glow = rgb565(200, 255, 220);
 

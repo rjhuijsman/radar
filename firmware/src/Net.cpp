@@ -137,11 +137,16 @@ void handleConfigBody(AsyncWebServerRequest* request, uint8_t* data,
 }
 
 void routes() {
-  g_server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+  // Qualify the method enum: WiFiManager pulls in the core WebServer, whose
+  // http_parser.h also defines an unscoped HTTP_GET/HTTP_POST, so the bare
+  // names are ambiguous here. AsyncWebRequestMethod:: names the async one.
+  g_server.on("/", AsyncWebRequestMethod::HTTP_GET,
+              [](AsyncWebServerRequest* request) {
     // ESP32 flash is memory-mapped, so the PROGMEM page is directly readable.
     request->send(200, "text/html", CONFIG_PAGE);
   });
-  g_server.on("/api/state", HTTP_GET, [](AsyncWebServerRequest* request) {
+  g_server.on("/api/state", AsyncWebRequestMethod::HTTP_GET,
+              [](AsyncWebServerRequest* request) {
     JsonDocument doc;
     lock();
     configToJson(*g_model, doc);
@@ -150,7 +155,7 @@ void routes() {
     serializeJson(doc, out);
     request->send(200, "application/json", out);
   });
-  g_server.on("/api/config", HTTP_POST,
+  g_server.on("/api/config", AsyncWebRequestMethod::HTTP_POST,
               [](AsyncWebServerRequest* request) {}, nullptr,
               handleConfigBody);
 }
@@ -187,15 +192,22 @@ bool begin(model::Model& model, SemaphoreHandle_t mutex) {
   g_model = &model;
   g_mutex = mutex;
 
-  LittleFS.begin(true);
+  bool fsOk = LittleFS.begin(true);
+  Serial.printf("[net] LittleFS mount: %s\n", fsOk ? "OK" : "FAILED");
   lock();
   loadConfig(model);
   unlock();
 
   WiFiManager manager;
+  Serial.printf("[net] starting Wi-Fi (portal SSID '%s' if unconfigured)...\n",
+                config::AP_NAME);
   if (!manager.autoConnect(config::AP_NAME)) {
+    Serial.println("[net] Wi-Fi portal timed out; caller may restart.");
     return false;  // Portal timed out; caller may restart.
   }
+  Serial.printf("[net] Wi-Fi up: SSID '%s', IP %s, http://%s.local/\n",
+                WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
+                config::MDNS_HOST);
   setupOta();
   routes();
   g_server.begin();
@@ -203,5 +215,7 @@ bool begin(model::Model& model, SemaphoreHandle_t mutex) {
 }
 
 void loopOta() { ArduinoOTA.handle(); }
+
+bool online() { return WiFi.isConnected(); }
 
 }  // namespace net

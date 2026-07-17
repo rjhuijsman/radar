@@ -46,15 +46,27 @@ void inputsTask(void*) {
 
 // Core 0: bring up Wi-Fi and the config server, then poll the feeds.
 void networkTask(void*) {
-  net::begin(g_model, g_mutex);
+  bool ok = net::begin(g_model, g_mutex);
   xSemaphoreTake(g_mutex, portMAX_DELAY);
+  g_model.ui.online = ok;
   seedDefaultHomeIfEmpty();
   feeds::reprojectStatics(g_model);
   xSemaphoreGive(g_mutex);
 
+  bool wasOnline = ok;
   uint32_t lastAdsb = 0, lastIcal = 0, lastWeather = 0;
   for (;;) {
     net::loopOta();  // Pick up any pending Wi-Fi update promptly.
+
+    // Reflect Wi-Fi drops/reconnects to the renderer (lock only on change).
+    bool nowOnline = net::online();
+    if (nowOnline != wasOnline) {
+      wasOnline = nowOnline;
+      xSemaphoreTake(g_mutex, portMAX_DELAY);
+      g_model.ui.online = nowOnline;
+      xSemaphoreGive(g_mutex);
+    }
+
     uint32_t now = millis();
     if (now - lastIcal >= config::ICAL_POLL_MS || lastIcal == 0) {
       lastIcal = now;
@@ -82,9 +94,21 @@ void networkTask(void*) {
 
 void setup() {
   Serial.begin(115200);
+  delay(300);  // Let the USB-CDC console attach before the first logs.
+  Serial.printf("\n\n[radar] === boot ===\n");
+  Serial.printf("[radar] chip %s rev %d, %d core(s) @ %d MHz\n",
+                ESP.getChipModel(), ESP.getChipRevision(),
+                ESP.getChipCores(), getCpuFrequencyMhz());
+  Serial.printf("[radar] flash %u MB, PSRAM %u/%u KB free, heap %u KB free\n",
+                ESP.getFlashChipSize() / (1024 * 1024),
+                ESP.getFreePsram() / 1024, ESP.getPsramSize() / 1024,
+                ESP.getFreeHeap() / 1024);
+
   g_mutex = xSemaphoreCreateMutex();
 
   g_gfx = display::begin();
+  Serial.printf("[radar] display: %s\n",
+                g_gfx ? "up" : "FAILED (gfx=null, rendering disabled)");
   seedDefaultHomeIfEmpty();
 
   // Every boot (cold or wake-from-sleep) opens with the power-on bloom.
@@ -92,6 +116,7 @@ void setup() {
 
   xTaskCreatePinnedToCore(inputsTask, "inputs", 4096, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(networkTask, "network", 8192, nullptr, 1, nullptr, 0);
+  Serial.println("[radar] setup complete; core-0 tasks running.");
 }
 
 void loop() {
@@ -120,6 +145,7 @@ void loop() {
     animProgress += static_cast<float>(dt) / 720.0f;
     bool done = radar::renderTransition(g_gfx, g_model, animProgress, false);
     xSemaphoreGive(g_mutex);
+    g_gfx->flush();  // Present the collapse frame (drawing is off-screen).
     if (done) {
       power::deepSleep();  // Does not return; wakes into a clean boot.
     }
@@ -129,4 +155,5 @@ void loop() {
     radar::renderScene(g_gfx, g_model);
   }
   xSemaphoreGive(g_mutex);
+  g_gfx->flush();  // Present the finished frame to the panel.
 }

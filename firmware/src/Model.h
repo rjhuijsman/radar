@@ -82,6 +82,7 @@ struct Ui {
   float sweepAngle = 200;      // Degrees.
   float brightness = 1.0f;     // Ambient-light dimming scalar.
   bool otaActive = false;      // An OTA update is in progress; defer sleep.
+  bool online = false;         // Wi-Fi associated; false shows "acquiring".
 };
 
 // The whole shared world plus UI state.
