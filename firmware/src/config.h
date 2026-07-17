@@ -43,10 +43,13 @@ constexpr uint8_t EXP_TFT_MOSI = 7;
 // Toggles are wired switch-to-GND and read with INPUT_PULLUP, so a closed
 // contact reads LOW. Sleep is on an RTC-capable pin so it can wake the
 // chip from deep sleep via ext0.
-constexpr int8_t PIN_SLEEP = 17;     // A0, RTC-capable (deep-sleep wake).
-constexpr int8_t PIN_DISPLAY_A = 16;  // A1, one throw of the 3-way toggle.
-constexpr int8_t PIN_DISPLAY_B = 43;  // TX, other throw of the 3-way toggle.
-constexpr int8_t PIN_GEO = 44;        // RX, geography overlay on/off.
+// Pad labels are the Qualia S3 breakout silkscreen. Note the board exposes
+// only the TX0 pad (GPIO43), NOT RX0 (GPIO44), so Geography lives on a spare
+// SPI-header pad instead.
+constexpr int8_t PIN_SLEEP = 17;      // A0 pad, RTC-capable (deep-sleep wake).
+constexpr int8_t PIN_DISPLAY_A = 16;  // A1 pad, one throw of the 3-way toggle.
+constexpr int8_t PIN_DISPLAY_B = 43;  // TX0 pad, other throw of the 3-way.
+constexpr int8_t PIN_GEO = 6;         // MISO pad, geography overlay on/off.
 
 // ---- I2C bus (STEMMA QT). Shared by the expander, encoder and sensor. ----
 constexpr int8_t I2C_SDA = 8;
