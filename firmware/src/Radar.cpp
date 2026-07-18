@@ -30,6 +30,26 @@ constexpr uint16_t C_RING = rgb565(24, 96, 66);
 constexpr uint16_t C_TICK = rgb565(30, 120, 84);
 constexpr uint16_t C_BG = rgb565(6, 20, 15);
 
+// Weather mode renders the green phosphor family in fluorescent blue —
+// the same brightness hierarchy with the hue shifted, like a different
+// phosphor in the same tube. Amber and the other accents stay put.
+constexpr uint16_t C_BLUE = rgb565(61, 164, 255);
+constexpr uint16_t C_RING_BLUE = rgb565(24, 66, 96);
+constexpr uint16_t C_TICK_BLUE = rgb565(30, 84, 120);
+
+bool bluePalette(const Model& model) {
+  return model.ui.display == DisplayMode::Weather;
+}
+uint16_t phosphorColor(const Model& model) {
+  return bluePalette(model) ? C_BLUE : C_GREEN;
+}
+uint16_t ringColor(const Model& model) {
+  return bluePalette(model) ? C_RING_BLUE : C_RING;
+}
+uint16_t tickColor(const Model& model) {
+  return bluePalette(model) ? C_TICK_BLUE : C_TICK;
+}
+
 const float kCenterX = config::PANEL_WIDTH / 2.0f;
 const float kCenterY = config::PANEL_HEIGHT / 2.0f;
 const float kRadius = config::PANEL_WIDTH * 0.46f;
@@ -125,7 +145,7 @@ void drawBackground(Arduino_GFX* gfx, const Model& model) {
   for (int i = 1; i <= 4; ++i) {
     float r = kRadius * i / 4.0f;
     gfx->drawCircle(kCenterX, kCenterY, static_cast<int16_t>(r),
-                    dim(i == 4 ? C_TICK : C_RING, k));
+                    dim(i == 4 ? tickColor(model) : ringColor(model), k));
   }
   // Bearing ticks every 30 degrees.
   for (int d = 0; d < 360; d += 30) {
@@ -133,13 +153,13 @@ void drawBackground(Arduino_GFX* gfx, const Model& model) {
     polar(d, kRadius, ox, oy);
     polar(d, kRadius - (d % 90 == 0 ? kRadius * 0.06f : kRadius * 0.035f), ix,
           iy);
-    gfx->drawLine(ix, iy, ox, oy, dim(C_TICK, k));
+    gfx->drawLine(ix, iy, ox, oy, dim(tickColor(model), k));
   }
   // Compass letters.
   const char* letters[4] = {"N", "E", "S", "W"};
   int angles[4] = {0, 90, 180, 270};
   gfx->setTextSize(2);
-  gfx->setTextColor(dim(C_GREEN, k));
+  gfx->setTextColor(dim(phosphorColor(model), k));
   for (int i = 0; i < 4; ++i) {
     float x, y;
     polar(angles[i], kRadius + 18, x, y);
@@ -152,14 +172,17 @@ void drawBackground(Arduino_GFX* gfx, const Model& model) {
     float x, y;
     polar(45, kRadius * frac, x, y);
     drawLabel(gfx, x + 4, y - 4, String(static_cast<int>(model.ui.range * frac)) + " NM",
-              dim(C_RING, k));
+              dim(ringColor(model), k));
   }
 }
 
-void drawSweep(Arduino_GFX* gfx, const Model& model) {
+// `fade` ramps the sweep in over the first moments online, so the handoff
+// from the acquiring-signal screen is a reveal rather than a hard cut.
+void drawSweep(Arduino_GFX* gfx, const Model& model, float fade) {
   float x, y;
   polar(model.ui.sweepAngle, kRadius, x, y);
-  gfx->drawLine(kCenterX, kCenterY, x, y, dim(C_GREEN, model.ui.brightness));
+  gfx->drawLine(kCenterX, kCenterY, x, y,
+                dim(phosphorColor(model), model.ui.brightness * fade));
 }
 
 void drawHomeMarker(Arduino_GFX* gfx, const Model& model) {
@@ -278,9 +301,12 @@ void drawWeather(Arduino_GFX* gfx, const Model& model) {
 }
 
 // Shown until Wi-Fi associates: "ACQUIRING SIGNAL" over the center, pulsing
-// in and out, while the scope keeps sweeping behind it.
-void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model) {
-  float k = model.ui.brightness;
+// in and out. `fade` is 1 while offline; once signal is acquired the title
+// is drawn a few more frames with a falling fade so it dissolves into the
+// live scope instead of hard-cutting (each frame erases and repaints it,
+// so the fade to black leaves no dark residue behind).
+void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model, float fade) {
+  float k = model.ui.brightness * fade;
   // Gentle brightness pulse, floored so the amber never darkens toward black —
   // fully dimming would punch dark holes in the phosphor graphics it sits over.
   float pulse = 0.68f + 0.32f * sinf(millis() / 360.0f);
@@ -304,8 +330,8 @@ void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model) {
   if (model.ui.lastInput.length() > 0) {
     uint32_t age = millis() - model.ui.lastInputMs;
     if (age < 2500) {
-      float fade = 1.0f - age / 2500.0f;
-      uint16_t ic = dim(C_CYAN, k * fade);
+      float lineFade = 1.0f - age / 2500.0f;
+      uint16_t ic = dim(C_CYAN, k * lineFade);
       const int isize = 2;
       const int icharW = 6 * isize;
       int ilen = model.ui.lastInput.length();
@@ -316,6 +342,40 @@ void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model) {
       gfx->print(model.ui.lastInput);
     }
   }
+}
+
+// Toggle feedback on the live scope: when the Display or Geography switch
+// changes, the new state flashes centered below the home marker and fades
+// out over 2.5 s, echoing the offline input-test line. Knob events show
+// nothing here — the reticle and zoom are their own feedback. Drawn inside
+// a tracked span (see drawDynamic), so the dirty-rect system erases it
+// cleanly with no ghosting.
+void drawToggleFlash(Arduino_GFX* gfx, const Model& model) {
+  if (model.ui.lastInput.isEmpty()) return;
+  uint32_t age = millis() - model.ui.lastInputMs;
+  if (age >= 2500) return;
+
+  String text;
+  if (model.ui.lastInput == "DISPLAY: WEATHER") {
+    text = "WEATHER";
+  } else if (model.ui.lastInput == "DISPLAY: FLIGHTS") {
+    text = "FLIGHTS";
+  } else if (model.ui.lastInput.startsWith("GEOGRAPHY")) {
+    text = model.ui.lastInput;
+  } else {
+    return;
+  }
+
+  float fade = 1.0f - age / 2500.0f;
+  uint16_t c = dim(C_CYAN, model.ui.brightness * fade);
+  const int size = 2;
+  const int charW = 6 * size;
+  gfx->setTextSize(size);
+  gfx->setTextColor(c);
+  gfx->setCursor(static_cast<int>(kCenterX) -
+                     (static_cast<int>(text.length()) * charW) / 2,
+                 static_cast<int>(kCenterY) + 40);
+  gfx->print(text);
 }
 
 // ---- Incremental (dirty-rect) renderer. ----
@@ -358,6 +418,14 @@ int16_t g_prevSweepX = 0, g_prevSweepY = 0;
 int16_t g_curSweepX = 0, g_curSweepY = 0;
 bool g_haveSweep = false;     // A previous sweep line is present to erase.
 bool g_curHaveSweep = false;  // This frame drew a sweep (offline suppresses it).
+
+// Offline-to-online handoff: when signal is acquired, the amber title
+// fades out and the sweep fades in over these windows, so the switch to
+// the live scope is a dissolve rather than a hard cut.
+bool g_wasOnline = false;
+uint32_t g_onlineSinceMs = 0;  // millis() when online last became true.
+constexpr uint32_t kSignalFadeMs = 900;
+constexpr uint32_t kSweepFadeMs = 1800;
 
 bool sigEqual(const StaticSig& a, const StaticSig& b) {
   return a.range100 == b.range100 && a.cx == b.cx && a.cy == b.cy &&
@@ -455,10 +523,16 @@ void endTrackPush() {
 // Order matches the original scene so the composite z-order is unchanged: the
 // sweep sits under the markers, which sit under the aircraft and overlay.
 void drawDynamic(Model& model) {
+  uint32_t onlineAge = millis() - g_onlineSinceMs;
+
   // The sweep only turns once signal is acquired; while offline it is neither
-  // drawn nor tracked, so nothing needs erasing for it next frame.
+  // drawn nor tracked, so nothing needs erasing for it next frame. It fades
+  // in over the handoff window when signal has just been acquired.
   if (model.ui.online) {
-    drawSweep(g_live, model);
+    float fade = onlineAge >= kSweepFadeMs
+                     ? 1.0f
+                     : onlineAge / static_cast<float>(kSweepFadeMs);
+    drawSweep(g_live, model, fade);
     float sx, sy;
     polar(model.ui.sweepAngle, kRadius, sx, sy);
     g_curSweepX = static_cast<int16_t>(sx);
@@ -486,9 +560,23 @@ void drawDynamic(Model& model) {
     }
   }
 
+  // Toggle feedback flashes on the live scope; offline, the input-test
+  // line inside drawAcquiringSignal already covers every control event.
+  if (model.ui.online) {
+    g_live->beginTrack();
+    drawToggleFlash(g_live, model);
+    endTrackPush();
+  }
+
   if (!model.ui.online) {
     g_live->beginTrack();
-    drawAcquiringSignal(g_live, model);
+    drawAcquiringSignal(g_live, model, 1.0f);
+    endTrackPush();
+  } else if (onlineAge < kSignalFadeMs) {
+    // Signal was just acquired: dissolve the title into the live scope.
+    g_live->beginTrack();
+    drawAcquiringSignal(g_live, model,
+                        1.0f - onlineAge / static_cast<float>(kSignalFadeMs));
     endTrackPush();
   }
 }
@@ -706,6 +794,13 @@ void invalidate() {
 }
 
 void renderIncremental(Model& model) {
+  // Track the offline-to-online edge that drives the handoff dissolve
+  // (title fading out, sweep fading in) in drawDynamic.
+  if (model.ui.online != g_wasOnline) {
+    g_wasOnline = model.ui.online;
+    if (model.ui.online) g_onlineSinceMs = millis();
+  }
+
   // Rebuild the static reference when the view, range, mode, geography or
   // brightness changed; that also forces one full repaint of the live buffer.
   StaticSig sig = staticSigOf(model);

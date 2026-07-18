@@ -52,9 +52,18 @@ uint32_t g_tSetupStart = 0, g_tDisplayUp = 0, g_tFirstFrame = 0,
 
 void seedDefaultHomeIfEmpty() {
   if (!g_model.homes.empty()) return;
-  model::Home home;
-  home.name = "Home";
-  g_model.homes.push_back(home);
+  // Fallbacks for a fresh or wiped filesystem, so the set still comes up
+  // on the real homes; a saved config replaces these when it loads.
+  model::Home gorssel;
+  gorssel.name = "GORSSEL";
+  gorssel.latitude = 52.19958603499725f;
+  gorssel.longitude = 6.198159997488504f;
+  g_model.homes.push_back(gorssel);
+  model::Home carl;
+  carl.name = "CARL";
+  carl.latitude = 55.66595793935845f;
+  carl.longitude = 12.531574542965174f;
+  g_model.homes.push_back(carl);
 }
 
 // Core 0: read the encoder, toggles and light sensor at ~50 Hz.
@@ -69,7 +78,11 @@ void inputsTask(void*) {
   }
 }
 
-// Core 0: bring up Wi-Fi and the config server, then poll the feeds.
+// Core 0: bring up Wi-Fi and the config server, then poll the feeds. The
+// polls take the model mutex themselves, and only briefly — to copy their
+// inputs out and merge parsed results in — never across a blocking HTTP
+// fetch, which would starve the render loop of the mutex for seconds and
+// visibly stall the picture every poll.
 void networkTask(void*) {
   BOOT_LOG("[boot] t=%6lu net::begin start (core 0)\n", millis());
   bool ok = net::begin(g_model, g_mutex);
@@ -98,21 +111,15 @@ void networkTask(void*) {
     uint32_t now = millis();
     if (now - lastIcal >= config::ICAL_POLL_MS || lastIcal == 0) {
       lastIcal = now;
-      xSemaphoreTake(g_mutex, portMAX_DELAY);
-      feeds::pollIcal(g_model);
-      xSemaphoreGive(g_mutex);
+      feeds::pollIcal(g_model, g_mutex);
     }
-    if (now - lastAdsb >= config::ADSB_POLL_MS) {
+    if (now - lastAdsb >= config::ADSB_POLL_MS || lastAdsb == 0) {
       lastAdsb = now;
-      xSemaphoreTake(g_mutex, portMAX_DELAY);
-      feeds::pollTraffic(g_model);
-      xSemaphoreGive(g_mutex);
+      feeds::pollTraffic(g_model, g_mutex);
     }
     if (now - lastWeather >= config::WEATHER_POLL_MS) {
       lastWeather = now;
-      xSemaphoreTake(g_mutex, portMAX_DELAY);
-      feeds::pollWeather(g_model);
-      xSemaphoreGive(g_mutex);
+      feeds::pollWeather(g_model, g_mutex);
     }
     vTaskDelay(pdMS_TO_TICKS(20));
   }
@@ -175,8 +182,13 @@ void setup() {
   // Every boot (cold or wake-from-sleep) opens with the power-on bloom.
   g_model.ui.screen = model::Screen::PoweringOn;
 
+  // The network task runs at idle priority: a multi-second TLS fetch is
+  // near-continuous CPU on core 0, and at any higher priority it starves
+  // the idle task until the task watchdog aborts (observed as a reboot
+  // loop on the first traffic poll). At priority 0 the scheduler
+  // round-robins it with the idle task, so the watchdog is always fed.
   xTaskCreatePinnedToCore(inputsTask, "inputs", 4096, nullptr, 3, nullptr, 0);
-  xTaskCreatePinnedToCore(networkTask, "network", 8192, nullptr, 1, nullptr, 0);
+  xTaskCreatePinnedToCore(networkTask, "network", 12288, nullptr, 0, nullptr, 0);
   BOOT_LOG("[boot] t=%6lu core-0 tasks created\n", millis());
   Serial.println("[radar] setup complete; core-0 tasks running.");
 }

@@ -57,8 +57,10 @@ constexpr int8_t I2C_SCL = 18;
 constexpr uint8_t LIGHT_ADDR = 0x10;  // Adafruit VEML7700 light sensor.
 
 // ---- Behavior constants. ----
-constexpr uint32_t SWEEP_PERIOD_MS = 6000;   // One revolution of the sweep.
-constexpr uint32_t ADSB_POLL_MS = 8000;      // Traffic feed poll interval.
+// The sweep period equals the traffic poll interval, so one rotation of
+// the sweep visually represents one poll cycle.
+constexpr uint32_t SWEEP_PERIOD_MS = 30000;  // One revolution of the sweep.
+constexpr uint32_t ADSB_POLL_MS = 30000;     // Traffic feed poll interval.
 constexpr uint32_t ICAL_POLL_MS = 300000;    // iCal feed poll interval (5 min).
 constexpr uint32_t WEATHER_POLL_MS = 300000;  // Rain radar poll interval.
 constexpr float DEFAULT_RANGE_NM = 40.0f;
