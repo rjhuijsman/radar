@@ -6,6 +6,7 @@
 
 #include <vector>
 
+#include "Feeds.h"
 #include "config.h"
 
 namespace inputs {
@@ -24,6 +25,7 @@ bool g_buttonDown = false;
 bool g_turnedWhileDown = false;  // A turn during a hold means "zoom", not "click".
 bool g_lastSleep = false;
 uint32_t g_lastLightMs = 0;
+uint32_t g_lastBrowseMs = 0;  // Last browse turn, for the selection timeout.
 
 // Records a control event so the offline "acquiring signal" screen can flash
 // it as a wiring test. Called under the model mutex (poll() already holds it).
@@ -52,6 +54,11 @@ void startFollow(Model& model, int aircraftIndex) {
   model.ui.followIndex = aircraftIndex;
   model.ui.candidate = -2;
   model.ui.browseSel = -1;
+  // Start the smoothed display position where the blip is drawn right now
+  // (the sweep-painted spot), so the follow glides from there to the live
+  // dead-reckoned track instead of jumping.
+  model::Aircraft& ac = model.aircraft[aircraftIndex];
+  ac.est = ac.seen ? ac.shown : ac.pos;
 }
 
 void goHome(Model& model) {
@@ -68,6 +75,7 @@ void rotarySelect(Model& model, int direction) {
     std::vector<int> list = {-1};  // -1 = no target selected.
     for (int i = 0; i < count; ++i) list.push_back(i);
     model.ui.browseSel = stepInList(model.ui.browseSel, direction, list);
+    g_lastBrowseMs = millis();  // Arms the back-to-no-selection timeout.
   } else {
     std::vector<int> list = {-2};  // -2 = no candidate.
     for (int i = 0; i < count; ++i) list.push_back(i);
@@ -82,6 +90,7 @@ void rotaryZoom(Model& model, int direction) {
   float range = model.ui.range * factor;
   range = max(config::MIN_RANGE_NM, min(config::MAX_RANGE_NM, range));
   model.ui.range = range;
+  model.ui.lastZoomMs = millis();  // Emphasizes the range readout briefly.
 }
 
 // A committing press.
@@ -92,6 +101,16 @@ void press(Model& model) {
     } else if (!model.homes.empty()) {
       model.ui.homeIndex = (model.ui.homeIndex + 1) %
                            static_cast<int>(model.homes.size());
+      // The world is measured from the active home: aircraft positions
+      // from the old home are hundreds of NM off, so drop them and ask
+      // the network task for an immediate refetch around the new one;
+      // POIs re-derive from their stored lat/lng right here.
+      model.aircraft.clear();
+      model.ui.candidate = -2;
+      feeds::reprojectStatics(model);
+      model.adsbPollDue = true;
+      noteInput(model, (String("HOME: ") +
+                        model.homes[model.ui.homeIndex].name).c_str());
     }
   } else {
     if (model.ui.candidate >= 0) {
@@ -201,6 +220,15 @@ void poll(Model& model) {
   readKnob(model);
   readToggles(model);
   readLight(model);
+
+  // Browse selections expire: with a hundred live targets a turn always
+  // lands on one, so without this the press-at-base home switch would be
+  // unreachable. No press within the window returns the reticle to the
+  // no-selection state (a press before that commits the follow as usual).
+  if (!model.ui.following && model.ui.browseSel != -1 &&
+      millis() - g_lastBrowseMs >= config::BROWSE_RESET_MS) {
+    model.ui.browseSel = -1;
+  }
 }
 
 }  // namespace inputs

@@ -33,6 +33,13 @@ struct Aircraft {
   Vec shown;
   bool seen = false;
   float freshness = 0;  // 1 just after a sweep pass, decays toward 0.
+
+  // Smooth-follow bookkeeping: `fixMs` is millis() when the feed last
+  // updated `pos` (0 until first merged), and `est` is the smoothed
+  // display position the followed flight is drawn at — dead-reckoned
+  // along the track between fixes, eased through each fix's correction.
+  uint32_t fixMs = 0;
+  Vec est;
 };
 
 struct Poi {
@@ -86,6 +93,7 @@ struct Ui {
 
   String lastInput;            // Last control event, flashed as a wiring test.
   uint32_t lastInputMs = 0;    // millis() when lastInput was recorded.
+  uint32_t lastZoomMs = 0;     // Last zoom detent; emphasizes the range readout.
 };
 
 // The whole shared world plus UI state.
@@ -95,6 +103,13 @@ struct Model {
   std::vector<Poi> pois;
   std::vector<Home> homes;
   std::vector<Feed> feeds;
+
+  // Traffic poll request, consumed (cleared) by the network task. Set by
+  // the renderer when the sweep crosses 12 o'clock — phase-locking fresh
+  // data to the sweep reaching top — and by a home switch, so the scope
+  // repopulates promptly around the new home. Starts true for an
+  // immediate first poll on boot.
+  bool adsbPollDue = true;
 };
 
 }  // namespace model

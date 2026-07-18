@@ -2,12 +2,17 @@
 // control (through the PCA9554 expander) used when entering and leaving
 // deep sleep.
 //
-// The panel runs with a SINGLE PSRAM framebuffer (plus the bounce buffer)
-// that the RGB peripheral scans continuously. The renderer draws small
-// dirty regions into that buffer in place, so there is no per-frame full
-// clear and no framebuffer flip. Two surfaces are exposed:
-//   * the live surface, an Arduino_Canvas aimed straight at the hardware
-//     framebuffer, and
+// The panel runs with TWO PSRAM framebuffers (plus the bounce buffer):
+// the front buffer is what the RGB peripheral scans, and the renderer
+// draws each frame's dirty regions into the back buffer, then flips.
+// The flip is a no-copy scan-out switch that the driver latches only at
+// the frame boundary, so a partially drawn frame is never scanned — the
+// erase-then-redraw window of the dirty-rect renderer cannot be sampled
+// mid-pass by the panel (which showed as flicker and a half-black sweep
+// when everything raced in one shared buffer). Surfaces exposed:
+//   * the live surface, an Arduino_Canvas the renderer retargets at the
+//     current back buffer (or the front one, for the incremental power
+//     transitions that intentionally draw in place), and
 //   * the static-reference surface, an off-screen Arduino_Canvas holding
 //     the unchanging scene (background, rings, weather, geography) that the
 //     renderer copies from to erase moving elements.
@@ -31,14 +36,14 @@ class StaticGfx : public Arduino_Canvas {
   void flush(bool = false) override {}  // Never scanned out; nothing to do.
 };
 
-// The live surface: an Arduino_Canvas aimed at the single hardware
-// framebuffer the panel scans continuously, so drawing lands on screen in
-// place with no flip. Two extras support incremental (dirty-rect) rendering:
+// The live surface: an Arduino_Canvas the renderer aims at one of the two
+// hardware framebuffers (see retarget). Two extras support incremental
+// (dirty-rect) rendering:
 //   * beginTrack()/endTrack() report the bounding box of everything drawn
 //     between them, so the renderer knows exactly which region to erase next
 //     frame, and
-//   * flush() blocks until the next VSYNC, pacing the render loop to the
-//     panel's refresh instead of spinning.
+//   * flush() blocks until the panel finishes consuming a frame, pacing the
+//     render loop to the panel's refresh instead of spinning.
 class LiveGfx : public Arduino_Canvas {
  public:
   LiveGfx(int16_t w, int16_t h, uint16_t* fb) : Arduino_Canvas(w, h, nullptr) {
@@ -46,8 +51,15 @@ class LiveGfx : public Arduino_Canvas {
   }
   bool begin(int32_t = GFX_NOT_DEFINED) override { return true; }
 
-  // Wait for the VSYNC ISR to notify this (the render) task. The 100 ms cap
-  // keeps a missed interrupt from stalling the loop forever.
+  // Re-aim the canvas at another framebuffer (the renderer points it at the
+  // back buffer each frame, or the front one during power transitions).
+  void retarget(uint16_t* fb) { _framebuffer = fb; }
+
+  // Wait for the frame-complete ISR to notify this (the render) task: the
+  // driver has copied a whole framebuffer to the LCD, which is also the
+  // moment a pending flip is latched, so the freshly freed buffer is safe
+  // to draw into. The 100 ms cap keeps a missed interrupt from stalling
+  // the loop forever.
   void flush(bool = false) override {
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
   }
@@ -108,15 +120,24 @@ class LiveGfx : public Arduino_Canvas {
 // first finished frame has been presented, so bring-up is never visible.
 Arduino_GFX* begin();
 
-// Accessors for the two surfaces and their raw framebuffers, used by the
-// incremental renderer to copy static regions over moving elements. Valid
-// only after a successful begin().
+// Accessors for the surfaces and raw framebuffers, used by the incremental
+// renderer to copy static regions over moving elements. Valid only after a
+// successful begin().
 LiveGfx* live();
 Arduino_GFX* staticRef();
-uint16_t* liveFb();
 uint16_t* staticFb();
 int16_t width();
 int16_t height();
+
+// Double-buffering: the front buffer is being scanned out; the renderer
+// draws into the back buffer and calls flip(), which asks the driver to
+// switch scan-out to it. The switch is latched at the next frame boundary
+// (the same event flush() waits on), so after the following flush() the
+// new back buffer is fully out of scan and safe to draw into.
+uint16_t* frontFb();
+uint16_t* backFb();
+int backIndex();
+void flip();
 
 // Turns the panel backlight on or off via the expander. I2C must still be
 // alive, so call this before `esp_deep_sleep_start()`, never after.

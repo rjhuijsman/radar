@@ -113,7 +113,18 @@ void networkTask(void*) {
       lastIcal = now;
       feeds::pollIcal(g_model, g_mutex);
     }
-    if (now - lastAdsb >= config::ADSB_POLL_MS || lastAdsb == 0) {
+    // Traffic polls on request — the renderer raises adsbPollDue when the
+    // sweep crosses 12 o'clock (its period equals the poll interval), and
+    // a home switch raises it for an immediate repopulate. The interval
+    // fallback covers a stalled render loop (e.g. display init failure).
+    bool adsbDue = false;
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (g_model.adsbPollDue) {
+      g_model.adsbPollDue = false;
+      adsbDue = true;
+    }
+    xSemaphoreGive(g_mutex);
+    if (adsbDue || now - lastAdsb >= 2 * config::ADSB_POLL_MS) {
       lastAdsb = now;
       feeds::pollTraffic(g_model, g_mutex);
     }
@@ -157,8 +168,8 @@ void setup() {
                 g_gfx ? "up" : "FAILED (gfx=null, rendering disabled)");
   if (g_gfx != nullptr) {
     radar::beginRenderer(display::live(), display::staticRef(),
-                         display::liveFb(), display::staticFb(),
-                         display::width(), display::height());
+                         display::staticFb(), display::width(),
+                         display::height());
   }
   seedDefaultHomeIfEmpty();
 
@@ -237,7 +248,7 @@ void loop() {
     radar::renderIncremental(g_model);
   }
   xSemaphoreGive(g_mutex);
-  g_gfx->flush();  // Block until the next vsync to pace the render loop.
+  g_gfx->flush();  // Block until the frame boundary that latches the flip.
 
   // The backlight is dark through bring-up, so the first thing the panel
   // ever shows is the frame just presented — never init garbage. Light it

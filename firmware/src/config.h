@@ -66,6 +66,10 @@ constexpr uint32_t WEATHER_POLL_MS = 300000;  // Rain radar poll interval.
 constexpr float DEFAULT_RANGE_NM = 40.0f;
 constexpr float MIN_RANGE_NM = 5.0f;
 constexpr float MAX_RANGE_NM = 240.0f;
+// A browse selection (knob turned, nothing committed) falls back to the
+// no-selection state after this idle time, so a press can reach the
+// home-switching action again even when the sky is full of targets.
+constexpr uint32_t BROWSE_RESET_MS = 4000;
 
 // SoftAP name for the first-run Wi-Fi captive portal.
 constexpr char AP_NAME[] = "Radar-Setup";

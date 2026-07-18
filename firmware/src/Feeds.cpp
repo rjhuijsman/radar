@@ -313,6 +313,15 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   // state carries across polls, then drop aircraft that left the feed.
   xSemaphoreTake(mutex, portMAX_DELAY);
 
+  // The home may have been switched while the fetch was in flight; these
+  // positions are relative to the old one, so drop them — the switch
+  // already requested a fresh poll around the new home.
+  if (activeHome(model).name != home.name) {
+    xSemaphoreGive(mutex);
+    Serial.println("[feeds] adsb: home changed mid-fetch; snapshot dropped.");
+    return false;
+  }
+
   // Removals shuffle indexes, so remember the followed aircraft by
   // callsign and re-point (or drop) the follow after the merge.
   String followed;
@@ -324,11 +333,16 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   std::set<String> present;
   for (const auto& parsed : snapshot) {
     model::Aircraft& ac = upsert(model, parsed.callsign);
+    bool fresh = ac.fixMs == 0;  // First fix for this aircraft.
     ac.pos = parsed.pos;
     ac.track = parsed.track;
     ac.groundSpeed = parsed.groundSpeed;
     ac.altitude = parsed.altitude;
     ac.special = parsed.special;
+    ac.fixMs = millis();
+    // Seed the smoothed display position; step() eases it from wherever
+    // it was through later fixes' corrections.
+    if (fresh) ac.est = ac.pos;
     present.insert(parsed.callsign);
   }
   for (int i = static_cast<int>(model.aircraft.size()) - 1; i >= 0; --i) {

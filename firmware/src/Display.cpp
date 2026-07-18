@@ -24,19 +24,20 @@ namespace {
 // controller and as the backlight control line.
 Arduino_XCA9554SWSPI* g_expander = nullptr;
 
-// The ESP32-S3 RGB LCD peripheral, driven directly so we can run with a
-// single PSRAM framebuffer that the renderer updates in place.
+// The ESP32-S3 RGB LCD peripheral, driven directly so we can run with two
+// PSRAM framebuffers the renderer flips between (see Display.h).
 esp_lcd_panel_handle_t g_panel = nullptr;
 
 // The render task (core-1 loop) that LiveGfx::flush() blocks on, notified
-// from the panel's VSYNC ISR so the loop paces to the panel refresh.
+// from the panel's frame-complete ISR so the loop paces to the refresh.
 volatile TaskHandle_t g_renderTask = nullptr;
 
-// The live surface (aimed at the scanned framebuffer) and the off-screen
-// static-reference surface, plus their raw framebuffers.
+// The live surface (retargeted at the current back framebuffer) and the
+// off-screen static-reference surface, plus the raw framebuffers.
 LiveGfx* g_live = nullptr;
 StaticGfx* g_static = nullptr;
-uint16_t* g_liveFb = nullptr;
+uint16_t* g_fbs[2] = {nullptr, nullptr};  // The two scan framebuffers.
+int g_front = 0;                          // Index being scanned out.
 uint16_t* g_staticFb = nullptr;
 
 // Boot-trace checkpoints recorded during begin(). They are also printed
@@ -56,10 +57,13 @@ void mark(const char* what) {
   BOOT_LOG("[boot] t=%6lu display: %s\n", millis(), what);
 }
 
-// Fires from the RGB driver ISR at each VSYNC. Waking the render task here
-// paces one rendered frame per panel refresh (~24.6 Hz) with no busy-wait.
-bool IRAM_ATTR onVsync(esp_lcd_panel_handle_t,
-                       const esp_lcd_rgb_panel_event_data_t*, void*) {
+// Fires from the RGB driver ISR each time a whole framebuffer has been
+// handed to the LCD — the same boundary where the driver latches a pending
+// flip. Waking the render task here paces one rendered frame per panel
+// refresh (~24.6 Hz) with no busy-wait, and guarantees that when flush()
+// returns after a flip, the new back buffer is fully out of scan.
+bool IRAM_ATTR onFrameDone(esp_lcd_panel_handle_t,
+                           const esp_lcd_rgb_panel_event_data_t*, void*) {
   BaseType_t woken = pdFALSE;
   if (g_renderTask) vTaskNotifyGiveFromISR(g_renderTask, &woken);
   return woken == pdTRUE;
@@ -102,11 +106,11 @@ Arduino_GFX* begin() {
                              sizeof(hd40015c40_init_operations));
   mark("panel-controller init done");
 
-  // A SINGLE framebuffer in PSRAM (no flip) plus a bounce buffer so the LCD
-  // FIFO refills from internal SRAM and cannot underrun when PSRAM is busy.
-  // This is IDF's stable "bounce buffer with single PSRAM frame buffer" mode:
-  // the CPU refills the bounce buffer from the PSRAM framebuffer, so the CPU
-  // writes we make into that framebuffer stay cache-coherent with scan-out.
+  // TWO framebuffers in PSRAM plus a bounce buffer so the LCD FIFO refills
+  // from internal SRAM and cannot underrun when PSRAM is busy. The CPU
+  // refills the bounce buffer from the PSRAM framebuffer, so the CPU writes
+  // we make into these framebuffers stay cache-coherent with scan-out, and
+  // the driver latches a flip only when it starts a new frame — tear-free.
   // Timings are the 4" round panel's; the pixel clock is its 16 MHz spec (the
   // library default of 12 MHz refreshes at a flickery ~18 Hz). Data-pin order
   // mirrors Arduino_ESP32RGBPanel. 720*720 is divisible by the bounce size.
@@ -134,7 +138,7 @@ Arduino_GFX* begin() {
           },
       .data_width = 16,
       .bits_per_pixel = 16,
-      .num_fbs = 1,
+      .num_fbs = 2,
       .bounce_buffer_size_px = (size_t)(config::PANEL_WIDTH * 20),
       .sram_trans_align = 8,
       .psram_trans_align = 64,
@@ -168,21 +172,24 @@ Arduino_GFX* begin() {
     return nullptr;
   }
 
-  // Register the VSYNC callback BEFORE init (per the IDF driver), so flush()
-  // can pace the render loop to the panel refresh.
+  // Register the frame-complete callback BEFORE init (per the IDF driver),
+  // so flush() can pace the render loop to the panel refresh.
   esp_lcd_rgb_panel_event_callbacks_t cbs = {};
-  cbs.on_vsync = onVsync;
+  cbs.on_frame_buf_complete = onFrameDone;
   esp_lcd_rgb_panel_register_event_callbacks(g_panel, &cbs, nullptr);
 
   esp_lcd_panel_reset(g_panel);
   esp_lcd_panel_init(g_panel);
 
   void* fb0 = nullptr;
-  if (esp_lcd_rgb_panel_get_frame_buffer(g_panel, 1, &fb0) != ESP_OK) {
-    Serial.println("[display] get_frame_buffer(1) failed.");
+  void* fb1 = nullptr;
+  if (esp_lcd_rgb_panel_get_frame_buffer(g_panel, 2, &fb0, &fb1) != ESP_OK) {
+    Serial.println("[display] get_frame_buffer(2) failed.");
     return nullptr;
   }
-  g_liveFb = static_cast<uint16_t*>(fb0);
+  g_fbs[0] = static_cast<uint16_t*>(fb0);
+  g_fbs[1] = static_cast<uint16_t*>(fb1);
+  g_front = 0;  // The driver scans fb 0 first.
 
   // The static-reference framebuffer is a second full-panel buffer in PSRAM.
   // The renderer paints the unchanging scene into it and copies sub-regions
@@ -195,18 +202,18 @@ Arduino_GFX* begin() {
     return nullptr;
   }
 
-  g_live = new LiveGfx(config::PANEL_WIDTH, config::PANEL_HEIGHT, g_liveFb);
+  g_live = new LiveGfx(config::PANEL_WIDTH, config::PANEL_HEIGHT, g_fbs[0]);
   g_static = new StaticGfx(config::PANEL_WIDTH, config::PANEL_HEIGHT, g_staticFb);
   Serial.printf(
-      "[display] panel up: %dx%d, single-fb, dirty-rect, vsync-paced.\n",
+      "[display] panel up: %dx%d, double-fb, dirty-rect, frame-paced.\n",
       config::PANEL_WIDTH, config::PANEL_HEIGHT);
 
-  // Clear the scanned buffer while the backlight is still dark. There is no
-  // flip: these writes are what the panel shows. The backlight stays off
-  // until main.cpp has presented a first finished frame, so bring-up and
-  // first-paint are never visible.
-  g_live->fillScreen(RGB565_BLACK);
-  mark("RGB peripheral up, buffer cleared");
+  // Clear both scan buffers while the backlight is still dark. The backlight
+  // stays off until main.cpp has presented a first finished frame, so
+  // bring-up and first-paint are never visible.
+  memset(g_fbs[0], 0, fbSize);
+  memset(g_fbs[1], 0, fbSize);
+  mark("RGB peripheral up, buffers cleared");
   return g_live;
 }
 
@@ -219,10 +226,33 @@ void printBootTrace() {
 
 LiveGfx* live() { return g_live; }
 Arduino_GFX* staticRef() { return g_static; }
-uint16_t* liveFb() { return g_liveFb; }
 uint16_t* staticFb() { return g_staticFb; }
 int16_t width() { return config::PANEL_WIDTH; }
 int16_t height() { return config::PANEL_HEIGHT; }
+
+uint16_t* frontFb() { return g_fbs[g_front]; }
+uint16_t* backFb() { return g_fbs[1 - g_front]; }
+int backIndex() { return 1 - g_front; }
+
+void flip() {
+  if (g_panel == nullptr) return;
+  // Passing a driver-owned framebuffer makes draw_bitmap a no-copy scan-out
+  // switch, latched when the driver next starts a frame. Clear any pending
+  // frame notification AFTER requesting the flip, so the flush() that
+  // follows wakes on a boundary that has definitely latched it — never on
+  // a boundary that already passed while this frame was being drawn.
+  g_front = 1 - g_front;
+  esp_err_t err = esp_lcd_panel_draw_bitmap(g_panel, 0, 0, config::PANEL_WIDTH,
+                                            config::PANEL_HEIGHT,
+                                            g_fbs[g_front]);
+  static bool logged = false;
+  if (err != ESP_OK && !logged) {
+    logged = true;
+    Serial.printf("[display] flip failed: %d\n", err);
+  }
+  TaskHandle_t task = g_renderTask;
+  if (task) ulTaskNotifyValueClear(task, UINT32_MAX);
+}
 
 void setBacklight(bool on) {
   if (g_expander == nullptr) {
