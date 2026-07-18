@@ -2,6 +2,7 @@
 
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <PNGdec.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
@@ -9,6 +10,7 @@
 #include <math.h>
 
 #include <algorithm>
+#include <new>
 #include <set>
 #include <vector>
 
@@ -288,6 +290,313 @@ model::Aircraft& upsert(model::Model& model, const String& callsign) {
   return model.aircraft.back();
 }
 
+// ---- Rain radar (RainViewer). ----
+//
+// RainViewer serves the world's composited radar as Web-Mercator PNG
+// tiles, a new frame every ~10 minutes. Each cycle here picks a zoom so
+// the visible disc fits in at most 2x2 tiles, fetches them, decodes the
+// palette back into reflectivity, and publishes the result as one
+// georeferenced pixel mosaic (model.weather) for the renderer to sample.
+// Everything network- and decode-heavy runs with no lock held.
+
+// Fetch tuning. Tiles are 256 px; RainViewer stops at zoom 7. A view
+// change refetches only once the view has settled on a different tile
+// cover, and failed cycles back off instead of hammering.
+constexpr int kWxTileSize = 256;
+constexpr int kWxMaxZoom = 7;   // RainViewer's documented tile maximum.
+constexpr int kWxMinZoom = 2;
+constexpr float kWxCoverMargin = 1.15f;  // Fetch a hair past the disc.
+constexpr uint32_t kWxSettleMs = 3000;
+constexpr uint32_t kWxRetryMs = 30000;
+constexpr size_t kWxMaxPngBytes = 192 * 1024;  // Sanity cap per tile.
+
+// The palette RainViewer actually serves. The tile URL's {color}
+// parameter is accepted but ignored these days — every scheme returns
+// byte-identical tiles in the documented "Universal Blue" palette
+// (rainviewer.com/api/color-schemes.html, CSV table) — and unsmoothed
+// tiles ("0_0" options) contain only exact palette entries, so
+// reflectivity is recovered by direct color match. `value` stores
+// dBZ + 32 (0 = no echo); the colors the table repeats (75+ dBZ) resolve
+// to the first hit, all deep inside the top intensity tier.
+struct WxColor {
+  uint32_t rgba;  // 0xRRGGBBAA.
+  uint8_t value;  // dBZ + 32.
+};
+constexpr WxColor kWxPalette[] = {
+    {0x63615914, 22}, {0x66635a19, 23}, {0x69665c1e, 24}, {0x6c685d24, 25},
+    {0x6f6b5f29, 26}, {0x726e612e, 27}, {0x75706234, 28}, {0x78736439, 29},
+    {0x7c75653e, 30}, {0x7f786744, 31}, {0x827b6949, 32}, {0x857d6a4e, 33},
+    {0x88806c54, 34}, {0x8b826d59, 35}, {0x8e856f5e, 36}, {0x92887164, 37},
+    {0x9e93756e, 38}, {0xaa9e7978, 39}, {0xb6a97e82, 40}, {0xc2b4828c, 41},
+    {0xcec08796, 42}, {0xd2c48ba0, 43}, {0xd6c88faa, 44}, {0xdacc93b4, 45},
+    {0xded097be, 46}, {0x88ddeeff, 47}, {0x6cd1ebff, 48}, {0x51c5e8ff, 49},
+    {0x36bae5ff, 50}, {0x1baee2ff, 51}, {0x00a3e0ff, 52}, {0x009ad5ff, 53},
+    {0x0091caff, 54}, {0x0088bfff, 55}, {0x007fb4ff, 56}, {0x0077aaff, 57},
+    {0x0070a3ff, 58}, {0x00699cff, 59}, {0x006295ff, 60}, {0x005b8eff, 61},
+    {0x005588ff, 62}, {0x005180ff, 63}, {0x004e78ff, 64}, {0x004a70ff, 65},
+    {0x004768ff, 66}, {0xffee00ff, 67}, {0xffe000ff, 68}, {0xffd200ff, 69},
+    {0xffc500ff, 70}, {0xffb700ff, 71}, {0xffaa00ff, 72}, {0xff9f00ff, 73},
+    {0xff9500ff, 74}, {0xff8b00ff, 75}, {0xff8100ff, 76}, {0xff4400ff, 77},
+    {0xf23600ff, 78}, {0xe62800ff, 79}, {0xd91b00ff, 80}, {0xcd0d00ff, 81},
+    {0xc10000ff, 82}, {0xa80000ff, 83}, {0x8f0000ff, 84}, {0x760000ff, 85},
+    {0x5d0000ff, 86}, {0xffaaffff, 87}, {0xff9fffff, 88}, {0xff95ffff, 89},
+    {0xff8bffff, 90}, {0xff81ffff, 91}, {0xff77ffff, 92}, {0xff6cffff, 93},
+    {0xff62ffff, 94}, {0xff58ffff, 95}, {0xff4effff, 96}, {0xffffffff, 97},
+    {0x00ff00ff, 107},
+};
+
+// The 1-4 tiles covering the visible disc: top-left tile index and count
+// per axis at a Web-Mercator zoom.
+struct WxCover {
+  uint8_t z = 0;
+  int32_t x0 = 0, y0 = 0;
+  int8_t nx = 0, ny = 0;
+};
+
+bool wxCoverEq(const WxCover& a, const WxCover& b) {
+  return a.z == b.z && a.x0 == b.x0 && a.y0 == b.y0 && a.nx == b.nx &&
+         a.ny == b.ny;
+}
+
+// Continuous Web-Mercator tile coordinates at zoom z.
+float wxTileX(float lonDeg, int z) {
+  return (lonDeg + 180.0f) / 360.0f * static_cast<float>(1 << z);
+}
+float wxTileY(float latDeg, int z) {
+  float lat = max(-85.0f, min(85.0f, latDeg));
+  float merc = asinhf(tanf(lat * DEG_TO_RAD));
+  return (1.0f - merc / static_cast<float>(M_PI)) * 0.5f *
+         static_cast<float>(1 << z);
+}
+
+// The deepest zoom whose 2x2 tiles still cover the disc of `rangeNm`
+// around the view — deepest first, so the mosaic carries the most detail
+// the cover allows.
+WxCover wxCoverFor(float lat, float lon, float rangeNm) {
+  float radius = rangeNm * kWxCoverMargin;
+  float latSpan = radius / 60.0f;
+  float lonSpan = radius / (60.0f * cosf(lat * DEG_TO_RAD));
+  WxCover cover;
+  for (int z = kWxMaxZoom; z >= kWxMinZoom; --z) {
+    int32_t x0 = static_cast<int32_t>(floorf(wxTileX(lon - lonSpan, z)));
+    int32_t x1 = static_cast<int32_t>(floorf(wxTileX(lon + lonSpan, z)));
+    int32_t y0 = static_cast<int32_t>(floorf(wxTileY(lat + latSpan, z)));
+    int32_t y1 = static_cast<int32_t>(floorf(wxTileY(lat - latSpan, z)));
+    cover.z = static_cast<uint8_t>(z);
+    cover.x0 = x0;
+    cover.y0 = y0;
+    cover.nx = static_cast<int8_t>(x1 - x0 >= 1 ? 2 : 1);
+    cover.ny = static_cast<int8_t>(y1 - y0 >= 1 ? 2 : 1);
+    if (x1 - x0 <= 1 && y1 - y0 <= 1) break;  // Fits; z below only loses detail.
+  }
+  // Keep the tile indices legal. Clamping only matters at latitudes no
+  // home is anywhere near; longitude wrap is likewise ignored.
+  int32_t n = 1 << cover.z;
+  cover.x0 = max<int32_t>(0, min<int32_t>(cover.x0, n - cover.nx));
+  cover.y0 = max<int32_t>(0, min<int32_t>(cover.y0, n - cover.ny));
+  return cover;
+}
+
+// Decode state threaded through the PNGdec line callback: where in the
+// mosaic this tile lands, plus a one-entry memo — radar images are long
+// runs of identical pixels, so most lookups hit it.
+struct WxDecodeCtx {
+  uint8_t* mosaic = nullptr;
+  int mosaicW = 0;
+  int offX = 0, offY = 0;
+  uint32_t lit = 0;      // Pixels with any echo, for the log line.
+  uint32_t unknown = 0;  // Colors that missed the palette table.
+  uint32_t memoRgba = 0;
+  uint8_t memoVal = 0;
+  bool haveMemo = false;
+};
+
+// Coarse fallback for a color that is not an exact palette entry (a
+// future palette tweak, or edge smoothing if it ever gets enabled). The
+// bands mirror the served palette: translucent warm gray is the drizzle
+// ramp, opaque blues rain, warm hues heavy rain.
+uint8_t wxClassify(uint32_t rgba) {
+  uint8_t r = rgba >> 24, g = rgba >> 16, b = rgba >> 8, a = rgba;
+  if (a < 8) return 0;
+  if (r + g + b < 30) return 0;       // Effectively black: no echo.
+  if (a < 250) return 24 + (a >> 3);  // Drizzle, graded by its alpha ramp.
+  if (b > r) return 58;               // Blue family: ~26 dBZ.
+  if (g > 100 && b < 100) return 70;  // Amber family: ~38 dBZ.
+  return 80;                          // Red and beyond: ~48 dBZ.
+}
+
+uint8_t wxValueFor(uint32_t rgba, WxDecodeCtx& ctx) {
+  if (ctx.haveMemo && rgba == ctx.memoRgba) return ctx.memoVal;
+  uint8_t value = 0;
+  bool found = false;
+  for (const WxColor& entry : kWxPalette) {
+    if (entry.rgba == rgba) {
+      value = entry.value;
+      found = true;
+      break;
+    }
+  }
+  if (!found) {
+    ++ctx.unknown;
+    value = wxClassify(rgba);
+  }
+  ctx.memoRgba = rgba;
+  ctx.memoVal = value;
+  ctx.haveMemo = true;
+  return value;
+}
+
+// One pixel of a decoded line as 0xRRGGBBAA. RainViewer serves 8-bit
+// RGBA tiles today; the palette and grayscale variants are handled so a
+// server-side re-encode degrades into a parse, not into garbage.
+uint32_t wxPixelRgba(const PNGDRAW* pDraw, int x) {
+  const uint8_t* p = pDraw->pPixels;
+  switch (pDraw->iPixelType) {
+    case PNG_PIXEL_TRUECOLOR_ALPHA:
+      p += x * 4;
+      return static_cast<uint32_t>(p[0]) << 24 |
+             static_cast<uint32_t>(p[1]) << 16 | p[2] << 8 | p[3];
+    case PNG_PIXEL_TRUECOLOR:
+      p += x * 3;
+      return static_cast<uint32_t>(p[0]) << 24 |
+             static_cast<uint32_t>(p[1]) << 16 | p[2] << 8 | 0xff;
+    case PNG_PIXEL_INDEXED: {
+      int index;
+      switch (pDraw->iBpp) {
+        case 8: index = p[x]; break;
+        case 4: index = (p[x / 2] >> ((x & 1) ? 0 : 4)) & 0xf; break;
+        case 2: index = (p[x / 4] >> (6 - 2 * (x & 3))) & 0x3; break;
+        default: index = (p[x / 8] >> (7 - (x & 7))) & 0x1; break;
+      }
+      const uint8_t* rgb = pDraw->pPalette + index * 3;
+      // PNGdec appends the tRNS alpha palette at offset 768 when present.
+      uint8_t alpha = pDraw->iHasAlpha ? pDraw->pPalette[768 + index] : 0xff;
+      return static_cast<uint32_t>(rgb[0]) << 24 |
+             static_cast<uint32_t>(rgb[1]) << 16 | rgb[2] << 8 | alpha;
+    }
+    case PNG_PIXEL_GRAY_ALPHA:
+      p += x * 2;
+      return static_cast<uint32_t>(p[0]) << 24 |
+             static_cast<uint32_t>(p[0]) << 16 | p[0] << 8 | p[1];
+    case PNG_PIXEL_GRAYSCALE:
+      if (pDraw->iBpp != 8) return 0;
+      return static_cast<uint32_t>(p[x]) << 24 |
+             static_cast<uint32_t>(p[x]) << 16 | p[x] << 8 | 0xff;
+    default:
+      return 0;
+  }
+}
+
+// PNGdec line callback: converts one tile row to reflectivity values in
+// place in the mosaic. Returns nonzero so the decode continues.
+int wxPngLine(PNGDRAW* pDraw) {
+  auto* ctx = static_cast<WxDecodeCtx*>(pDraw->pUser);
+  uint8_t* row = ctx->mosaic +
+                 static_cast<size_t>(ctx->offY + pDraw->y) * ctx->mosaicW +
+                 ctx->offX;
+  for (int x = 0; x < pDraw->iWidth; ++x) {
+    uint32_t rgba = wxPixelRgba(pDraw, x);
+    uint8_t value = 0;
+    if ((rgba & 0xffu) != 0) {  // Transparent = no echo, the common case.
+      value = wxValueFor(rgba, *ctx);
+      if (value != 0) ++ctx->lit;
+    }
+    row[x] = value;
+  }
+  return 1;
+}
+
+// Weather fetch state, only ever touched from the network task.
+String g_wxTileBase;        // host+path of the newest frame, from the index.
+uint32_t g_wxIndexMs = 0;   // When the index was last fetched (0 = never).
+uint32_t g_wxLastTryMs = 0; // Last attempt that did not publish (backoff).
+PNG* g_wxPng = nullptr;     // PNGdec instance; ~48 KB, so it lives in PSRAM.
+WxCover g_wxWant;           // Last desired cover, for the settle debounce.
+uint32_t g_wxWantMs = 0;
+
+// Fetches the RainViewer frame index and caches the newest past frame's
+// tile base URL. The index is a couple of hundred bytes of JSON, so the
+// String round-trip through httpGet is fine.
+bool refreshWxIndex() {
+  if (!g_wxTileBase.isEmpty() &&
+      millis() - g_wxIndexMs < config::WEATHER_POLL_MS) {
+    return true;
+  }
+  String body;
+  if (!httpGet("https://api.rainviewer.com/public/weather-maps.json", body)) {
+    Serial.println("[feeds] wx: index fetch failed.");
+    // A previously fetched frame stays valid for a while; reuse it.
+    return !g_wxTileBase.isEmpty();
+  }
+  static SpiRamAllocator allocator;
+  JsonDocument doc(&allocator);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
+  const char* host = doc["host"];
+  JsonArrayConst past = doc["radar"]["past"].as<JsonArrayConst>();
+  if (host == nullptr || past.size() == 0) {
+    Serial.println("[feeds] wx: index has no radar frames.");
+    return false;
+  }
+  const char* path = past[past.size() - 1]["path"];
+  if (path == nullptr) return false;
+  g_wxTileBase = String(host) + path;
+  g_wxIndexMs = millis();
+  return true;
+}
+
+// Fetches one tile PNG into `pngBuf` and decodes it into the mosaic at
+// (offX, offY). Modeled on fetchTraffic: bulk reads through the yielding
+// reader, and no lock held anywhere near this.
+bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
+                 uint8_t* pngBuf, WxDecodeCtx& ctx, int offX, int offY) {
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[feeds] wx: HTTP %d for tile.\n", code);
+    http.end();
+    return false;
+  }
+  // The tile cache always announces a length; without one the body would
+  // have to be read to connection close, which a keep-alive socket turns
+  // into a full timeout. Fail fast instead.
+  int announced = http.getSize();
+  if (announced <= 0 || announced > static_cast<int>(kWxMaxPngBytes)) {
+    Serial.printf("[feeds] wx: %d-byte tile refused.\n", announced);
+    http.end();
+    return false;
+  }
+  YieldingReader reader(http.getStream());
+  size_t len = reader.readBytes(reinterpret_cast<char*>(pngBuf),
+                                static_cast<size_t>(announced));
+  http.end();
+  if (len != static_cast<size_t>(announced)) {
+    Serial.println("[feeds] wx: short tile body.");
+    return false;
+  }
+
+  ctx.offX = offX;
+  ctx.offY = offY;
+  if (g_wxPng->openRAM(pngBuf, static_cast<int>(len), wxPngLine) !=
+      PNG_SUCCESS) {
+    Serial.println("[feeds] wx: tile is not a PNG.");
+    return false;
+  }
+  if (g_wxPng->getWidth() != kWxTileSize ||
+      g_wxPng->getHeight() != kWxTileSize) {
+    Serial.printf("[feeds] wx: unexpected %dx%d tile.\n", g_wxPng->getWidth(),
+                  g_wxPng->getHeight());
+    g_wxPng->close();
+    return false;
+  }
+  int rc = g_wxPng->decode(&ctx, 0);
+  g_wxPng->close();
+  if (rc != PNG_SUCCESS) {
+    Serial.printf("[feeds] wx: PNG decode failed (%d).\n", rc);
+    return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
@@ -419,12 +728,133 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
 }
 
 void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
-  // TODO(weather): fetch the latest RainViewer frame's tiles covering the
-  // view and reproject them into the scope's azimuthal projection. Follow
-  // the pollTraffic pattern: fetch and reproject with no lock held, then
-  // merge under the mutex briefly.
-  (void)model;
-  (void)mutex;
+  if (!WiFi.isConnected()) return;
+
+  // Snapshot the view under the mutex: where the scope is looking, and
+  // what the published layer already covers.
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  const model::Home& home = activeHome(model);
+  float lat = home.latitude + model.ui.viewCenter.y / 60.0f;
+  float lon = home.longitude + model.ui.viewCenter.x /
+                                   (60.0f * cosf(home.latitude * DEG_TO_RAD));
+  float range = model.ui.range;
+  bool haveLayer = model.weather.cells != nullptr;
+  uint32_t fetchedMs = model.weather.fetchedMs;
+  WxCover loaded;
+  if (haveLayer) {
+    loaded.z = model.weather.zoom;
+    loaded.x0 = model.weather.originX / kWxTileSize;
+    loaded.y0 = model.weather.originY / kWxTileSize;
+    loaded.nx = static_cast<int8_t>(model.weather.width / kWxTileSize);
+    loaded.ny = static_cast<int8_t>(model.weather.height / kWxTileSize);
+  }
+  xSemaphoreGive(mutex);
+
+  // Decide whether a fetch is due at all: the refetch interval elapsed,
+  // or the view wants a different tile cover and has settled on it (so a
+  // held zoom knob cannot queue a fetch per detent). Failures back off.
+  WxCover want = wxCoverFor(lat, lon, range);
+  uint32_t now = millis();
+  if (!wxCoverEq(want, g_wxWant)) {
+    g_wxWant = want;
+    g_wxWantMs = now;
+  }
+  bool stale = !haveLayer || now - fetchedMs >= config::WEATHER_POLL_MS;
+  bool moved = haveLayer && !wxCoverEq(want, loaded) &&
+               now - g_wxWantMs >= kWxSettleMs;
+  if (!stale && !moved) return;
+  if (g_wxLastTryMs != 0 && now - g_wxLastTryMs < kWxRetryMs) return;
+  g_wxLastTryMs = now;  // Cleared below if the cycle publishes.
+
+  // Do not start a cycle the heaps cannot absorb: the TLS session lives
+  // on the internal heap; the tile PNGs, the decoder state and both the
+  // old and new mosaics in PSRAM. Skipping a check is invisible.
+  size_t mosaicBytes = static_cast<size_t>(want.nx) * want.ny * kWxTileSize *
+                       kWxTileSize;
+  if (ESP.getFreeHeap() < 40 * 1024 ||
+      heap_caps_get_free_size(MALLOC_CAP_SPIRAM) <
+          mosaicBytes + kWxMaxPngBytes + sizeof(PNG) + 512 * 1024) {
+    Serial.printf("[feeds] wx: memory low (heap %u KB, PSRAM %u KB); skipping.\n",
+                  ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
+    return;
+  }
+  if (!refreshWxIndex()) return;
+
+  // The PNG decoder is ~48 KB of mostly inflate window — far too big for
+  // the internal heap, so it lives in PSRAM, allocated once.
+  if (g_wxPng == nullptr) {
+    void* mem =
+        heap_caps_malloc(sizeof(PNG), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (mem == nullptr) return;
+    g_wxPng = new (mem) PNG();
+  }
+
+  uint32_t started = millis();
+  uint8_t* cells = static_cast<uint8_t*>(
+      heap_caps_malloc(mosaicBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  uint8_t* pngBuf = static_cast<uint8_t*>(
+      heap_caps_malloc(kWxMaxPngBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (cells == nullptr || pngBuf == nullptr) {
+    heap_caps_free(cells);
+    heap_caps_free(pngBuf);
+    return;
+  }
+  memset(cells, 0, mosaicBytes);
+
+  WxDecodeCtx ctx;
+  ctx.mosaic = cells;
+  ctx.mosaicW = want.nx * kWxTileSize;
+
+  WiFiClientSecure client;
+  // TODO(security): install a CA bundle and validate certificates.
+  client.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(kHttpTimeoutMs);
+  http.setTimeout(kHttpTimeoutMs);
+  http.setUserAgent(kUserAgent);
+  http.setReuse(true);  // The tiles share one host (and TLS session).
+  bool ok = true;
+  for (int ty = 0; ty < want.ny && ok; ++ty) {
+    for (int tx = 0; tx < want.nx && ok; ++tx) {
+      // {size}/{z}/{x}/{y}/{color}/{smooth}_{snow}: unsmoothed, so pixels
+      // stay exact palette entries the table above can match.
+      String url = g_wxTileBase + "/" + String(kWxTileSize) + "/" +
+                   String(want.z) + "/" + String(want.x0 + tx) + "/" +
+                   String(want.y0 + ty) + "/2/0_0.png";
+      ok = wxFetchTile(http, client, url, pngBuf, ctx, tx * kWxTileSize,
+                       ty * kWxTileSize);
+    }
+  }
+  heap_caps_free(pngBuf);
+  if (!ok) {
+    heap_caps_free(cells);
+    Serial.println("[feeds] wx: cycle failed; keeping last layer.");
+    return;
+  }
+  g_wxLastTryMs = 0;
+
+  // Publish under the mutex, briefly. The mosaic is georeferenced
+  // absolutely, so a home switched mid-fetch needs no invalidation — the
+  // switch only changes what the next cover check asks for.
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  heap_caps_free(model.weather.cells);
+  model.weather.cells = cells;
+  model.weather.width = static_cast<int16_t>(want.nx * kWxTileSize);
+  model.weather.height = static_cast<int16_t>(want.ny * kWxTileSize);
+  model.weather.zoom = want.z;
+  model.weather.originX = want.x0 * kWxTileSize;
+  model.weather.originY = want.y0 * kWxTileSize;
+  model.weather.fetchedMs = millis();
+  ++model.weather.generation;
+  xSemaphoreGive(mutex);
+
+  Serial.printf(
+      "[feeds] wx: %dx%d tiles z%u published (%lu lit px, %lu unknown, "
+      "%lu ms, heap %u KB, PSRAM %u KB)\n",
+      want.nx, want.ny, want.z, static_cast<unsigned long>(ctx.lit),
+      static_cast<unsigned long>(ctx.unknown),
+      static_cast<unsigned long>(millis() - started), ESP.getFreeHeap() / 1024,
+      ESP.getFreePsram() / 1024);
 }
 
 void reprojectStatics(model::Model& model) {

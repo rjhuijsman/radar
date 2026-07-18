@@ -25,7 +25,14 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex);
 // callsigns used by `pollTraffic`. Returns the number of feeds fetched.
 int pollIcal(model::Model& model, SemaphoreHandle_t mutex);
 
-// TODO(weather): fetch and reproject the current RainViewer frame.
+// Keeps the rain-radar layer current. When the refetch interval has
+// elapsed — or the view has left the fetched tiles and settled — fetches
+// the newest RainViewer frame's Web-Mercator tiles covering the view,
+// decodes their palette back into reflectivity, and publishes the mosaic
+// as `model.weather` for the renderer to sample. The fetch and decode run
+// with no lock held; the mutex is taken only to snapshot the view and to
+// swap the finished layer in. Network-free and cheap when nothing is due,
+// so it can be called every couple of seconds.
 void pollWeather(model::Model& model, SemaphoreHandle_t mutex);
 
 // Recomputes each POI's world position from its lat/lng relative to the

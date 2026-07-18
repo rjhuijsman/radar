@@ -62,7 +62,12 @@ constexpr uint8_t LIGHT_ADDR = 0x10;  // Adafruit VEML7700 light sensor.
 constexpr uint32_t SWEEP_PERIOD_MS = 30000;  // One revolution of the sweep.
 constexpr uint32_t ADSB_POLL_MS = 30000;     // Traffic feed poll interval.
 constexpr uint32_t ICAL_POLL_MS = 300000;    // iCal feed poll interval (5 min).
-constexpr uint32_t WEATHER_POLL_MS = 300000;  // Rain radar poll interval.
+// Rain radar: RainViewer publishes a new frame only every ~10 min, so the
+// refetch interval is long; the check interval is how often pollWeather
+// gets a chance to notice the interval elapsed or the view having left
+// the fetched tiles (the check itself is network-free and cheap).
+constexpr uint32_t WEATHER_POLL_MS = 300000;   // Rain radar refetch interval.
+constexpr uint32_t WEATHER_CHECK_MS = 2000;    // Rain radar due-check interval.
 constexpr float DEFAULT_RANGE_NM = 40.0f;
 constexpr float MIN_RANGE_NM = 5.0f;
 constexpr float MAX_RANGE_NM = 240.0f;

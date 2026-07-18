@@ -128,7 +128,10 @@ void networkTask(void*) {
       lastAdsb = now;
       feeds::pollTraffic(g_model, g_mutex);
     }
-    if (now - lastWeather >= config::WEATHER_POLL_MS) {
+    // Weather checks are frequent but cheap: pollWeather itself decides
+    // when a real fetch is due (refetch interval elapsed, or the view
+    // settled on tiles the fetched mosaic no longer covers).
+    if (now - lastWeather >= config::WEATHER_CHECK_MS) {
       lastWeather = now;
       feeds::pollWeather(g_model, g_mutex);
     }
@@ -199,7 +202,8 @@ void setup() {
   // loop on the first traffic poll). At priority 0 the scheduler
   // round-robins it with the idle task, so the watchdog is always fed.
   xTaskCreatePinnedToCore(inputsTask, "inputs", 4096, nullptr, 3, nullptr, 0);
-  xTaskCreatePinnedToCore(networkTask, "network", 12288, nullptr, 0, nullptr, 0);
+  // Network stack sized for TLS plus the weather path's PNG inflate.
+  xTaskCreatePinnedToCore(networkTask, "network", 16384, nullptr, 0, nullptr, 0);
   BOOT_LOG("[boot] t=%6lu core-0 tasks created\n", millis());
   Serial.println("[radar] setup complete; core-0 tasks running.");
 }

@@ -65,6 +65,23 @@ struct Feed {
   bool enabled = true;
 };
 
+// The rain-radar layer published by feeds::pollWeather: RainViewer
+// reflectivity decoded into a Web-Mercator pixel mosaic the renderer
+// samples at static-rebuild time. The mosaic is georeferenced absolutely
+// (tile origin in global pixels at `zoom`), so it stays correct across
+// home switches and zooms; only its coverage goes stale. `cells` lives in
+// PSRAM and is swapped (old buffer freed) under the model mutex.
+struct WeatherLayer {
+  uint8_t* cells = nullptr;   // Per-pixel dBZ + 32; 0 = no echo. Row-major.
+  int16_t width = 0;          // Mosaic size in pixels.
+  int16_t height = 0;
+  uint8_t zoom = 0;           // Web-Mercator zoom of the source tiles.
+  int32_t originX = 0;        // Mosaic top-left, in global pixels at `zoom`
+  int32_t originY = 0;        // (tile index * 256).
+  uint32_t fetchedMs = 0;     // millis() when fetched; gates staleness.
+  uint32_t generation = 0;    // Bumped per publish; re-fingerprints statics.
+};
+
 // The 2-position Display toggle: flights layer or weather layer.
 enum class DisplayMode { Flights, Weather };
 
@@ -103,6 +120,7 @@ struct Model {
   std::vector<Poi> pois;
   std::vector<Home> homes;
   std::vector<Feed> feeds;
+  WeatherLayer weather;
 
   // Traffic poll request, consumed (cleared) by the network task. Set by
   // the renderer when the sweep crosses 12 o'clock — phase-locking fresh

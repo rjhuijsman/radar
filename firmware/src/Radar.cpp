@@ -165,8 +165,10 @@ void drawLabel(Arduino_GFX* gfx, float x, float y, const String& text,
   gfx->print(text);
 }
 
+// The ring metalwork, ticks, compass letters and ring labels. The field
+// fill itself happens in renderStatic — the weather underlay slots in
+// between the fill and this, so the rings read over the rain.
 void drawBackground(Arduino_GFX* gfx, const Model& model) {
-  gfx->fillScreen(C_BG);
   float k = model.ui.brightness;
   // Four range rings.
   for (int i = 1; i <= 4; ++i) {
@@ -523,16 +525,95 @@ void drawAirports(Arduino_GFX* gfx, const Model& model) {
   }
 }
 
-// TODO(feeds): replace with reprojected RainViewer tiles. Sample cells so
-// the Weather layer is visible.
+// ---- Weather underlay (RainViewer reflectivity mosaic). ----
+//
+// feeds::pollWeather publishes model.weather: real radar reflectivity
+// decoded into a Web-Mercator pixel mosaic. The scope samples it on a
+// coarse cell grid — rain is diffuse, so cells a fiftieth of the panel
+// wide read as weather, not pixels — mapping each cell center through
+// the same home-anchored equirectangular world the feeds use, then
+// through exact Mercator once per row. Draws into the static reference
+// only, so the sampling runs per rebuild, never per frame.
+
+constexpr int kWxCellPx = 15;  // Cell size; 48 cells across the panel.
+// A layer this old is worse than none — the sky has moved on. It also
+// stops counting toward the static-scene fingerprint (staticSigOf), so
+// the expiry itself repaints the rain away.
+constexpr uint32_t kWxStaleMs = 30 * 60 * 1000;
+
+// Reflectivity tiers, in the layer's dBZ + 32 encoding. Below the first
+// is drizzle and noise the scope leaves dark.
+constexpr uint8_t kWxLight = 42;     // 10 dBZ.
+constexpr uint8_t kWxModerate = 57;  // 25 dBZ.
+constexpr uint8_t kWxHeavy = 67;     // 35 dBZ.
+constexpr uint8_t kWxIntense = 77;   // 45 dBZ.
+
+// The mockup's rain treatment as opaque RGB565: dim green through green
+// to an amber then red core, each pre-blended toward C_BG at the mockup
+// underlay's translucency, so the wash reads as sitting behind the ring
+// metalwork (which renderStatic draws over it).
+constexpr uint16_t C_WX_LIGHT = rgb565(22, 62, 43);
+constexpr uint16_t C_WX_MODERATE = rgb565(56, 108, 62);
+constexpr uint16_t C_WX_HEAVY = rgb565(110, 96, 34);
+constexpr uint16_t C_WX_INTENSE = rgb565(110, 50, 46);
+
+bool weatherUsable(const Model& model) {
+  return model.weather.cells != nullptr &&
+         millis() - model.weather.fetchedMs < kWxStaleMs;
+}
+
 void drawWeather(Arduino_GFX* gfx, const Model& model) {
-  static const float cells[][3] = {{-16, 9, 13}, {13, -13, 17}, {26, 19, 10}};
+  if (!weatherUsable(model)) return;  // No data (yet): a clear scope.
+  const model::WeatherLayer& wx = model.weather;
+
+  float homeLat = 0, homeLon = 0;
+  if (model.ui.homeIndex >= 0 &&
+      model.ui.homeIndex < static_cast<int>(model.homes.size())) {
+    homeLat = model.homes[model.ui.homeIndex].latitude;
+    homeLon = model.homes[model.ui.homeIndex].longitude;
+  }
   float ppn = pixelsPerNm(model);
-  uint16_t c = dim(rgb565(60, 150, 90), model.ui.brightness);
-  for (auto& cell : cells) {
-    float x, y;
-    project(model, Vec{cell[0], cell[1]}, x, y);
-    gfx->fillCircle(x, y, static_cast<int16_t>(cell[2] * ppn * 0.5f), c);
+  float cosLat = cosf(homeLat * DEG_TO_RAD);
+  float scale = 256.0f * static_cast<float>(1 << wx.zoom);
+
+  // Screen x to global Mercator pixel x is one multiply-add (longitude
+  // is linear in screen x under the feeds' equirectangular world);
+  // latitude goes through exact Mercator once per cell row.
+  float ax = scale / (360.0f * 60.0f * cosLat * ppn);
+  float bx = (homeLon +
+              (model.ui.viewCenter.x - kCenterX / ppn) / (60.0f * cosLat) +
+              180.0f) /
+                 360.0f * scale -
+             static_cast<float>(wx.originX);
+
+  float k = model.ui.brightness;
+  uint16_t tier[4] = {dim(C_WX_LIGHT, k), dim(C_WX_MODERATE, k),
+                      dim(C_WX_HEAVY, k), dim(C_WX_INTENSE, k)};
+  float r2 = kRadius * kRadius;
+
+  for (int y0 = 0; y0 < config::PANEL_HEIGHT; y0 += kWxCellPx) {
+    float cy = y0 + kWxCellPx * 0.5f;
+    float dy = cy - kCenterY;
+    float worldY = model.ui.viewCenter.y + (kCenterY - cy) / ppn;
+    float lat = homeLat + worldY / 60.0f;
+    if (lat > 85.0f || lat < -85.0f) continue;
+    float merc = asinhf(tanf(lat * DEG_TO_RAD));
+    float fy = (1.0f - merc / static_cast<float>(M_PI)) * 0.5f * scale -
+               static_cast<float>(wx.originY);
+    if (fy < 0 || fy >= wx.height) continue;
+    const uint8_t* row = wx.cells + static_cast<size_t>(fy) * wx.width;
+    for (int x0 = 0; x0 < config::PANEL_WIDTH; x0 += kWxCellPx) {
+      float cx = x0 + kWxCellPx * 0.5f;
+      float dx = cx - kCenterX;
+      if (dx * dx + dy * dy > r2) continue;  // Outside the scope disc.
+      float fx = ax * cx + bx;
+      if (fx < 0 || fx >= wx.width) continue;
+      int ix = static_cast<int>(fx);
+      uint8_t v = row[ix];
+      if (v < kWxLight) continue;  // No echo (or drizzle below the floor).
+      int t = v >= kWxIntense ? 3 : v >= kWxHeavy ? 2 : v >= kWxModerate ? 1 : 0;
+      gfx->fillRect(x0, y0, kWxCellPx, kWxCellPx, tier[t]);
+    }
   }
 }
 
@@ -657,6 +738,7 @@ struct StaticSig {
   uint8_t online = 0;      // Online: gates the weather layer into the reference.
   int8_t home = 0;         // Active home (geography anchor, name label).
   uint8_t emph = 0;        // Range readout emphasized (recent zoom detent).
+  uint32_t wxGen = 0;      // Weather layer generation, while it is drawn.
 };
 StaticSig g_sig;
 
@@ -692,7 +774,8 @@ constexpr uint32_t kSweepFadeMs = 1800;
 bool sigEqual(const StaticSig& a, const StaticSig& b) {
   return a.range100 == b.range100 && a.cx == b.cx && a.cy == b.cy &&
          a.mode == b.mode && a.geo == b.geo && a.bright == b.bright &&
-         a.online == b.online && a.home == b.home && a.emph == b.emph;
+         a.online == b.online && a.home == b.home && a.emph == b.emph &&
+         a.wxGen == b.wxGen;
 }
 
 StaticSig staticSigOf(const Model& model) {
@@ -709,6 +792,12 @@ StaticSig staticSigOf(const Model& model) {
   s.online = model.ui.online ? 1 : 0;
   s.home = static_cast<int8_t>(model.ui.homeIndex);
   s.emph = millis() - model.ui.lastZoomMs < kZoomEmphasisMs ? 1 : 0;
+  // A newly published weather layer re-fingerprints the scene, but only
+  // while the layer is actually drawn; its expiry drops the generation
+  // back to 0, which repaints the stale rain away.
+  if (model.ui.online && showWeather(model) && weatherUsable(model)) {
+    s.wxGen = model.weather.generation;
+  }
   return s;
 }
 
@@ -815,12 +904,15 @@ void drawRangeReadout(Arduino_GFX* gfx, const Model& model) {
   gfx->print(text);
 }
 
-// Paints the unchanging scene into the static-reference surface. The weather
-// layer is suppressed while offline, so the acquiring-signal screen stays
-// uncluttered by the placeholder cells; it appears once signal is acquired.
+// Paints the unchanging scene into the static-reference surface. The rain
+// underlay goes down first, straight onto the field, so the ring
+// metalwork, geography and labels all read over it (the mockup's
+// layering; the sweep and blips draw over everything later). It is
+// suppressed while offline, keeping the acquiring-signal screen clean.
 void renderStatic(Model& model) {
-  drawBackground(g_static, model);
+  g_static->fillScreen(C_BG);
   if (model.ui.online && showWeather(model)) drawWeather(g_static, model);
+  drawBackground(g_static, model);
   if (model.ui.geography) drawGeography(g_static, model);
   // Airports ride the flights layer (they hide in weather-only mode,
   // like the traffic and POIs), independent of the Geography toggle.
