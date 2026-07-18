@@ -192,13 +192,6 @@ void drawPoi(Arduino_GFX* gfx, const Model& model, const model::Poi& poi) {
   drawLabel(gfx, x - 12, y + 14, poi.name, c);
 }
 
-void drawAirportsAndPois(Arduino_GFX* gfx, const Model& model) {
-  for (const auto& poi : model.pois) {
-    if (distanceFrom(model, poi.pos) > model.ui.range) continue;
-    drawPoi(gfx, model, poi);
-  }
-}
-
 void drawEdgeArrow(Arduino_GFX* gfx, const Model& model, const Aircraft& ac,
                    float distance) {
   uint16_t c = dim(ac.special ? C_AMBER : C_WHITE, model.ui.brightness);
@@ -302,6 +295,27 @@ void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model) {
   gfx->setCursor(static_cast<int>(kCenterX) - (len * charW) / 2,
                  static_cast<int>(kCenterY) - charH / 2);
   gfx->print(msg);
+
+  // Input-test line: flashes the most recent control event below the title so
+  // the offline screen doubles as a wiring check. Fades out over ~2500 ms.
+  // Drawn INSIDE the acquiring-signal element's tracked span (see drawDynamic),
+  // so the dirty-rect box grows to cover it and it is erased and repainted
+  // every frame with no ghosting.
+  if (model.ui.lastInput.length() > 0) {
+    uint32_t age = millis() - model.ui.lastInputMs;
+    if (age < 2500) {
+      float fade = 1.0f - age / 2500.0f;
+      uint16_t ic = dim(C_CYAN, k * fade);
+      const int isize = 2;
+      const int icharW = 6 * isize;
+      int ilen = model.ui.lastInput.length();
+      gfx->setTextSize(isize);
+      gfx->setTextColor(ic);
+      gfx->setCursor(static_cast<int>(kCenterX) - (ilen * icharW) / 2,
+                     static_cast<int>(kCenterY) + charH / 2 + 12);
+      gfx->print(model.ui.lastInput);
+    }
+  }
 }
 
 // ---- Incremental (dirty-rect) renderer. ----
@@ -329,6 +343,7 @@ struct StaticSig {
   uint8_t mode = 0;        // Display mode (weather layer on/off).
   uint8_t geo = 0;         // Geography overlay on/off.
   int16_t bright = 0;      // Brightness * 64 (ambient dimming of static colors).
+  uint8_t online = 0;      // Online: gates the weather layer into the reference.
 };
 StaticSig g_sig;
 
@@ -341,11 +356,13 @@ std::vector<Rect> g_curRects;   // Moving-element boxes drawn this frame.
 // Previous sweep line endpoint; its start is always the panel center.
 int16_t g_prevSweepX = 0, g_prevSweepY = 0;
 int16_t g_curSweepX = 0, g_curSweepY = 0;
-bool g_haveSweep = false;
+bool g_haveSweep = false;     // A previous sweep line is present to erase.
+bool g_curHaveSweep = false;  // This frame drew a sweep (offline suppresses it).
 
 bool sigEqual(const StaticSig& a, const StaticSig& b) {
   return a.range100 == b.range100 && a.cx == b.cx && a.cy == b.cy &&
-         a.mode == b.mode && a.geo == b.geo && a.bright == b.bright;
+         a.mode == b.mode && a.geo == b.geo && a.bright == b.bright &&
+         a.online == b.online;
 }
 
 StaticSig staticSigOf(const Model& model) {
@@ -357,6 +374,7 @@ StaticSig staticSigOf(const Model& model) {
   s.mode = static_cast<uint8_t>(model.ui.display);
   s.geo = model.ui.geography ? 1 : 0;
   s.bright = static_cast<int16_t>(lroundf(model.ui.brightness * 64.0f));
+  s.online = model.ui.online ? 1 : 0;
   return s;
 }
 
@@ -417,10 +435,12 @@ void restoreAll() {
   memcpy(g_liveFb, g_staticFb, static_cast<size_t>(g_w) * g_h * 2);
 }
 
-// Paints the unchanging scene into the static-reference surface.
+// Paints the unchanging scene into the static-reference surface. The weather
+// layer is suppressed while offline, so the acquiring-signal screen stays
+// uncluttered by the placeholder cells; it appears once signal is acquired.
 void renderStatic(Model& model) {
   drawBackground(g_static, model);
-  if (showWeather(model)) drawWeather(g_static, model);
+  if (model.ui.online && showWeather(model)) drawWeather(g_static, model);
   if (model.ui.geography) drawGeography(g_static, model);
 }
 
@@ -435,11 +455,18 @@ void endTrackPush() {
 // Order matches the original scene so the composite z-order is unchanged: the
 // sweep sits under the markers, which sit under the aircraft and overlay.
 void drawDynamic(Model& model) {
-  drawSweep(g_live, model);
-  float sx, sy;
-  polar(model.ui.sweepAngle, kRadius, sx, sy);
-  g_curSweepX = static_cast<int16_t>(sx);
-  g_curSweepY = static_cast<int16_t>(sy);
+  // The sweep only turns once signal is acquired; while offline it is neither
+  // drawn nor tracked, so nothing needs erasing for it next frame.
+  if (model.ui.online) {
+    drawSweep(g_live, model);
+    float sx, sy;
+    polar(model.ui.sweepAngle, kRadius, sx, sy);
+    g_curSweepX = static_cast<int16_t>(sx);
+    g_curSweepY = static_cast<int16_t>(sy);
+    g_curHaveSweep = true;
+  } else {
+    g_curHaveSweep = false;
+  }
 
   g_live->beginTrack();
   drawHomeMarker(g_live, model);
@@ -464,6 +491,197 @@ void drawDynamic(Model& model) {
     drawAcquiringSignal(g_live, model);
     endTrackPush();
   }
+}
+
+// ---- Incremental power on/off transitions. ----
+//
+// The transitions share the single framebuffer with the panel scan-out, so
+// they must never rewrite the whole frame at once — a full-frame write races
+// the scan and tears, which is exactly what the old fillScreen-per-frame
+// versions did. Instead each frame touches only a small delta: a growing
+// shape covers its predecessor, or a band of rows is copied/blanked at the
+// edges of the region that changed.
+
+constexpr float kBloomDotEnd = 0.18f;      // Bloom: dot until here...
+constexpr float kBloomLineEnd = 0.4f;      // ...line until here, then reveal.
+constexpr float kCollapseLineStart = 0.55f;  // Collapse: squeeze until here...
+constexpr float kCollapseDotStart = 0.82f;   // ...line until here, then dot.
+
+constexpr uint16_t kGlow = rgb565(200, 255, 220);
+
+int g_transPhase = -1;    // -1 idle; else the current phase of a transition.
+Rect g_transShape;        // Bloom dot/line drawn last frame (for hand-offs).
+int16_t g_transTop = 0;   // Revealed/surviving row band: first row...
+int16_t g_transBot = 0;   // ...and one past the last.
+int16_t g_transL = 0;     // Collapse line: first lit column...
+int16_t g_transR = 0;     // ...and one past the last.
+
+// One frame of the power-on bloom: a growing dot, a widening line, then the
+// scene revealed in a band opening out from the line, with a glowing edge.
+// The reveal copies rows from the static reference, so on completion the
+// live buffer matches it exactly and the incremental renderer can take over
+// without a full repaint.
+bool renderBloom(Arduino_GFX* gfx, Model& model, float p) {
+  const int16_t cx = static_cast<int16_t>(kCenterX);
+  const int16_t cy = static_cast<int16_t>(kCenterY);
+
+  if (g_transPhase < 0) {
+    // First frame. The backlight is still off (main.cpp lights it only after
+    // this frame is presented), so the one full clear here is never seen
+    // mid-write. Bake the scene the reveal will copy from into the static
+    // reference now, and adopt its fingerprint so the hand-off is seamless.
+    gfx->fillScreen(RGB565_BLACK);
+    renderStatic(model);
+    g_sig = staticSigOf(model);
+    g_needStatic = false;
+    g_transShape = Rect{0, 0, 0, 0};
+    g_transPhase = 0;
+  }
+
+  if (p < kBloomDotEnd) {  // Dot: grows in place, covering its predecessor.
+    int r = 2 + static_cast<int>(8 * p / kBloomDotEnd);
+    gfx->fillCircle(cx, cy, r, kGlow);
+    g_transShape = Rect{static_cast<int16_t>(cx - r),
+                        static_cast<int16_t>(cy - r),
+                        static_cast<int16_t>(2 * r + 1),
+                        static_cast<int16_t>(2 * r + 1)};
+    return false;
+  }
+
+  if (p < kBloomLineEnd) {  // Line: widens in place over the dot's rows.
+    if (g_transPhase == 0) {
+      // The dot pokes above and below the line's rows; black it out once.
+      gfx->fillRect(g_transShape.x, g_transShape.y, g_transShape.w,
+                    g_transShape.h, RGB565_BLACK);
+      g_transPhase = 1;
+    }
+    int w = static_cast<int>(g_w * (p - kBloomDotEnd) /
+                             (kBloomLineEnd - kBloomDotEnd));
+    if (w < 6) w = 6;
+    gfx->fillRect(cx - w / 2, cy - 2, w, 4, kGlow);
+    g_transShape = Rect{static_cast<int16_t>(cx - w / 2),
+                        static_cast<int16_t>(cy - 2),
+                        static_cast<int16_t>(w), 4};
+    return false;
+  }
+
+  if (g_transPhase != 2) {  // Line hands off to the opening reveal band.
+    gfx->fillRect(g_transShape.x, g_transShape.y, g_transShape.w,
+                  g_transShape.h, RGB565_BLACK);
+    g_transTop = g_transBot = cy;  // Band starts empty at the fold line.
+    g_transPhase = 2;
+  }
+
+  // Reveal: the band [top, bot) shows the static reference; each frame only
+  // the newly exposed rows are copied in, and a 2 px glow edge rides the
+  // opening edges (restored to scene rows once they become interior).
+  float rp = (p - kBloomLineEnd) / (1.0f - kBloomLineEnd);
+  int h = static_cast<int>(g_h * rp);
+  int top = cy - h / 2;
+  if (top < 0) top = 0;
+  int bot = top + h;
+  if (bot > g_h) bot = g_h;
+  if (top > g_transTop) top = g_transTop;  // Never un-reveal on jitter.
+  if (bot < g_transBot) bot = g_transBot;
+
+  if (g_transBot > g_transTop) {  // Consume last frame's edge glow.
+    restoreRect(Rect{0, g_transTop, static_cast<int16_t>(g_w), 2});
+    restoreRect(Rect{0, static_cast<int16_t>(g_transBot - 2),
+                     static_cast<int16_t>(g_w), 2});
+  }
+  if (top < g_transTop) {
+    restoreRect(Rect{0, static_cast<int16_t>(top), static_cast<int16_t>(g_w),
+                     static_cast<int16_t>(g_transTop - top)});
+  }
+  if (bot > g_transBot) {
+    restoreRect(Rect{0, g_transBot, static_cast<int16_t>(g_w),
+                     static_cast<int16_t>(bot - g_transBot)});
+  }
+  g_transTop = top;
+  g_transBot = bot;
+
+  if (p >= 1.0f) {
+    // The band spans the panel and the glow has been consumed: the live
+    // buffer now matches the static reference exactly. Hand the scope to
+    // the incremental renderer with no pending full repaint — it only has
+    // to add the moving elements on top.
+    g_prevRects.clear();
+    g_haveSweep = false;
+    g_needFull = false;
+    g_transPhase = -1;
+    return true;
+  }
+  gfx->fillRect(0, top, g_w, 2, kGlow);
+  gfx->fillRect(0, bot - 2, g_w, 2, kGlow);
+  return false;
+}
+
+// One frame of the power-off collapse: the live scene is consumed in place —
+// rows blank toward a bright fold line, the line shrinks to a dot, and deep
+// sleep (which cuts the backlight) takes it from there. Only the newly
+// blanked rows/columns are written each frame.
+bool renderCollapse(Arduino_GFX* gfx, float p) {
+  const int16_t cx = static_cast<int16_t>(kCenterX);
+  const int16_t cy = static_cast<int16_t>(kCenterY);
+
+  if (g_transPhase < 0) {
+    g_transTop = 0;  // The whole steady-state frame is still lit.
+    g_transBot = g_h;
+    g_transL = 0;
+    g_transR = g_w;
+    g_transPhase = 0;
+    gfx->fillRect(0, cy - 2, g_w, 4, kGlow);  // The fold line appears.
+  }
+
+  // Squeeze: blank rows from both edges toward the fold line. Runs every
+  // frame (a no-op once converged), so a stalled frame can never leave
+  // stragglers behind.
+  int h = p < kCollapseLineStart
+              ? static_cast<int>(g_h * (1.0f - p / kCollapseLineStart))
+              : 4;
+  if (h < 4) h = 4;
+  int top = cy - h / 2;
+  int bot = top + h;
+  if (top < g_transTop) top = g_transTop;  // Shrink only.
+  if (bot > g_transBot) bot = g_transBot;
+  if (top > g_transTop) {
+    gfx->fillRect(0, g_transTop, g_w, top - g_transTop, RGB565_BLACK);
+  }
+  if (bot < g_transBot) {
+    gfx->fillRect(0, bot, g_w, g_transBot - bot, RGB565_BLACK);
+  }
+  g_transTop = top;
+  g_transBot = bot;
+
+  if (p >= kCollapseLineStart && p < kCollapseDotStart) {
+    // The line burns down from both ends toward the center.
+    int lw = static_cast<int>(g_w * (1.0f - (p - kCollapseLineStart) /
+                                                (kCollapseDotStart -
+                                                 kCollapseLineStart)));
+    if (lw < 6) lw = 6;
+    int l = cx - lw / 2;
+    int r = l + lw;
+    if (l > g_transL) {
+      gfx->fillRect(g_transL, cy - 2, l - g_transL, 4, RGB565_BLACK);
+      g_transL = l;
+    }
+    if (r < g_transR) {
+      gfx->fillRect(r, cy - 2, g_transR - r, 4, RGB565_BLACK);
+      g_transR = r;
+    }
+    g_transPhase = 1;
+  } else if (p >= kCollapseDotStart && g_transPhase != 2) {
+    // What is left of the line becomes the ember dot.
+    gfx->fillRect(g_transL, cy - 2, g_transR - g_transL, 4, RGB565_BLACK);
+    gfx->fillCircle(cx, cy, 4, kGlow);
+    g_transPhase = 2;
+  }
+
+  if (p >= 1.0f) {
+    g_transPhase = -1;
+    return true;
+  }
+  return false;
 }
 
 }  // namespace
@@ -505,7 +723,7 @@ void renderIncremental(Model& model) {
     g_prevRects.swap(g_curRects);
     g_prevSweepX = g_curSweepX;
     g_prevSweepY = g_curSweepY;
-    g_haveSweep = true;
+    g_haveSweep = g_curHaveSweep;
     g_needFull = false;
     return;
   }
@@ -520,7 +738,7 @@ void renderIncremental(Model& model) {
   g_prevRects.swap(g_curRects);
   g_prevSweepX = g_curSweepX;
   g_prevSweepY = g_curSweepY;
-  g_haveSweep = true;
+  g_haveSweep = g_curHaveSweep;
 }
 
 void step(Model& model, uint32_t dtMs) {
@@ -551,50 +769,26 @@ void step(Model& model, uint32_t dtMs) {
   }
 }
 
-void renderScene(Arduino_GFX* gfx, Model& model) {
-  drawBackground(gfx, model);
-  if (showWeather(model)) drawWeather(gfx, model);
-  if (model.ui.geography) drawGeography(gfx, model);
-  drawSweep(gfx, model);
-  drawHomeMarker(gfx, model);
-  if (showFlights(model)) {
-    drawAirportsAndPois(gfx, model);
-    for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
-      drawAircraft(gfx, model, model.aircraft[i], i);
-    }
-  }
-  if (!model.ui.online) drawAcquiringSignal(gfx, model);
-}
-
 bool renderTransition(Arduino_GFX* gfx, Model& model, float progress,
                       bool poweringOn) {
-  gfx->fillScreen(RGB565_BLACK);
   float p = min(1.0f, progress);
-  uint16_t glow = rgb565(200, 255, 220);
+  return poweringOn ? renderBloom(gfx, model, p) : renderCollapse(gfx, p);
+}
 
-  if (!poweringOn) {  // CRT collapse: scene squeezes to a line, then a dot.
-    if (p < 0.55f) {
-      int h = max(2, static_cast<int>(config::PANEL_HEIGHT * (1 - p / 0.55f)));
-      gfx->fillRect(0, kCenterY - h / 2, config::PANEL_WIDTH, h,
-                    rgb565(10, 40, 28));
-      gfx->fillRect(0, kCenterY - 2, config::PANEL_WIDTH, 4, glow);
-    } else if (p < 0.82f) {
-      int w = max(6, static_cast<int>(config::PANEL_WIDTH * (1 - (p - 0.55f) / 0.27f)));
-      gfx->fillRect(kCenterX - w / 2, kCenterY - 2, w, 4, glow);
-    } else {
-      gfx->fillCircle(kCenterX, kCenterY, 4, glow);
-    }
-  } else {  // Bloom: dot, line, then the live scene opens vertically.
-    if (p < 0.18f) {
-      gfx->fillCircle(kCenterX, kCenterY, 2 + static_cast<int>(8 * p / 0.18f), glow);
-    } else if (p < 0.4f) {
-      int w = static_cast<int>(config::PANEL_WIDTH * (p - 0.18f) / 0.22f);
-      gfx->fillRect(kCenterX - w / 2, kCenterY - 2, max(6, w), 4, glow);
-    } else {
-      renderScene(gfx, model);  // Reveal is approximate on-panel.
-    }
-  }
-  return p >= 1.0f;
+void showMissingKey(Arduino_GFX* gfx) {
+  // Styled like the acquiring-signal title: amber, size 3, centered. Drawn
+  // once onto black while the backlight is still off, so it appears whole;
+  // main.cpp owns the dwell time and the deep sleep that follows.
+  gfx->fillScreen(RGB565_BLACK);
+  const char* msg = "MISSING KEY";
+  const int len = 11;
+  const int size = 3;
+  const int charW = 6 * size, charH = 8 * size;
+  gfx->setTextSize(size);
+  gfx->setTextColor(C_AMBER);
+  gfx->setCursor(static_cast<int>(kCenterX) - (len * charW) / 2,
+                 static_cast<int>(kCenterY) - charH / 2);
+  gfx->print(msg);
 }
 
 }  // namespace radar

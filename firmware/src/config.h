@@ -40,22 +40,21 @@ constexpr uint8_t EXP_BTN_DN = 6;
 constexpr uint8_t EXP_TFT_MOSI = 7;
 
 // ---- Controls (the remaining native GPIO). ----
-// Toggles are wired switch-to-GND and read with INPUT_PULLUP, so a closed
+// Switches are wired switch-to-GND and read with INPUT_PULLUP, so a closed
 // contact reads LOW. Sleep is on an RTC-capable pin so it can wake the
 // chip from deep sleep via ext0.
-// Pad labels are the Qualia S3 breakout silkscreen. Note the board exposes
-// only the TX0 pad (GPIO43), NOT RX0 (GPIO44), so Geography lives on a spare
-// SPI-header pad instead.
-constexpr int8_t PIN_SLEEP = 17;      // A0 pad, RTC-capable (deep-sleep wake).
-constexpr int8_t PIN_DISPLAY_A = 16;  // A1 pad, one throw of the 3-way toggle.
-constexpr int8_t PIN_DISPLAY_B = 43;  // TX0 pad, other throw of the 3-way.
-constexpr int8_t PIN_GEO = 6;         // MISO pad, geography overlay on/off.
+// Pad labels are the Qualia S3 breakout silkscreen. Display is a single
+// 2-position toggle; Geography sits on the TX0 pad (its brief ROM boot
+// output is harmless, since Serial runs over USB-CDC). This leaves the whole
+// SPI header (SCK5/MISO6/MOSI7/CS15) free for a possible future SD card.
+constexpr int8_t PIN_SLEEP = 17;    // A0 pad, RTC-capable (deep-sleep wake).
+constexpr int8_t PIN_DISPLAY = 16;  // A1 pad, 2-position Flights/Weather toggle.
+constexpr int8_t PIN_GEO = 43;      // TX0 pad, geography overlay on/off.
 
 // ---- I2C bus (STEMMA QT). Shared by the expander, encoder and sensor. ----
 constexpr int8_t I2C_SDA = 8;
 constexpr int8_t I2C_SCL = 18;
-constexpr uint8_t ENCODER_ADDR = 0x36;  // Adafruit seesaw QT rotary encoder.
-constexpr uint8_t LIGHT_ADDR = 0x10;    // Adafruit VEML7700 light sensor.
+constexpr uint8_t LIGHT_ADDR = 0x10;  // Adafruit VEML7700 light sensor.
 
 // ---- Behavior constants. ----
 constexpr uint32_t SWEEP_PERIOD_MS = 6000;   // One revolution of the sweep.

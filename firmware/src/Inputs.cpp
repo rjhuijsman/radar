@@ -1,7 +1,7 @@
 #include "Inputs.h"
 
 #include <Adafruit_VEML7700.h>
-#include <Adafruit_seesaw.h>
+#include <Modulino.h>
 #include <Wire.h>
 
 #include <vector>
@@ -15,19 +15,22 @@ using model::DisplayMode;
 using model::Model;
 using model::Screen;
 
-// The seesaw exposes the encoder push button on this pin.
-constexpr uint8_t SEESAW_SWITCH = 24;
-
-Adafruit_seesaw g_encoder;
+ModulinoKnob g_knob;  // Arduino Modulino Knob (I2C, auto-discovered at 0x3B).
 Adafruit_VEML7700 g_light;
-bool g_encoderOk = false;
+bool g_knobOk = false;
 bool g_lightOk = false;
 
-int32_t g_lastEncoder = 0;
 bool g_buttonDown = false;
 bool g_turnedWhileDown = false;  // A turn during a hold means "zoom", not "click".
 bool g_lastSleep = false;
 uint32_t g_lastLightMs = 0;
+
+// Records a control event so the offline "acquiring signal" screen can flash
+// it as a wiring test. Called under the model mutex (poll() already holds it).
+void noteInput(Model& model, const char* msg) {
+  model.ui.lastInput = msg;
+  model.ui.lastInputMs = millis();
+}
 
 // Steps `current` one detent along `list` (wrapping) and returns the new
 // value. Used to browse the target/candidate rings.
@@ -100,24 +103,28 @@ void press(Model& model) {
 }
 
 void readToggles(Model& model) {
-  // 3-way Display, on-off-on: each throw shorts one pin to GND. Center
-  // (both open) is "both".
-  bool a = digitalRead(config::PIN_DISPLAY_A) == LOW;
-  bool b = digitalRead(config::PIN_DISPLAY_B) == LOW;
-  if (a && !b) {
-    model.ui.display = DisplayMode::Flights;
-  } else if (!a && b) {
-    model.ui.display = DisplayMode::Weather;
-  } else {
-    model.ui.display = DisplayMode::Both;
+  // 2-position Display toggle: closed (LOW) selects Weather, open (HIGH)
+  // selects Flights. The polarity is trivially flipped by swapping the two
+  // modes here. Note only on an actual change, so it does not spam the poll.
+  DisplayMode display = digitalRead(config::PIN_DISPLAY) == LOW
+                            ? DisplayMode::Weather
+                            : DisplayMode::Flights;
+  if (display != model.ui.display) {
+    model.ui.display = display;
+    noteInput(model, display == DisplayMode::Weather ? "DISPLAY: WEATHER"
+                                                     : "DISPLAY: FLIGHTS");
   }
 
-  model.ui.geography = digitalRead(config::PIN_GEO) == LOW;
+  bool geo = digitalRead(config::PIN_GEO) == LOW;
+  if (geo != model.ui.geography) {
+    model.ui.geography = geo;
+    noteInput(model, geo ? "GEOGRAPHY: ON" : "GEOGRAPHY: OFF");
+  }
 
-  // Sleep: closed (LOW) requests deep sleep. Trigger the power-down once,
-  // on the transition, while the screen is on and no OTA update is running
-  // (an update must not be interrupted mid-flash).
-  bool sleep = digitalRead(config::PIN_SLEEP) == LOW;
+  // Sleep (power switch, inverted): OPEN (HIGH) is the OFF position, CLOSED
+  // (LOW) is ON. Request deep sleep on the transition into OFF (HIGH), while
+  // the screen is on and no OTA update is running (never interrupt a flash).
+  bool sleep = digitalRead(config::PIN_SLEEP) == HIGH;
   if (sleep && !g_lastSleep && model.ui.screen == Screen::On &&
       !model.ui.otaActive) {
     model.ui.screen = Screen::PoweringOff;
@@ -137,21 +144,23 @@ void readLight(Model& model) {
   model.ui.brightness = scalar;
 }
 
-void readEncoder(Model& model) {
-  if (!g_encoderOk) {
+void readKnob(Model& model) {
+  if (!g_knobOk) {
     return;
   }
-  bool down = !g_encoder.digitalRead(SEESAW_SWITCH);  // Active low.
+  bool down = g_knob.isPressed();  // Active HIGH on the Modulino (no inversion).
   if (down && !g_buttonDown) {
     g_buttonDown = true;
     g_turnedWhileDown = false;
   }
 
-  int32_t position = g_encoder.getEncoderPosition();
-  int32_t delta = position - g_lastEncoder;
-  g_lastEncoder = position;
-  int direction = delta > 0 ? 1 : -1;
-  for (int32_t i = 0; i < abs(delta); ++i) {
+  // getDirection() debounces the quadrature into one clean +1/-1 per physical
+  // detent. The raw get() count jitters mid-detent (a single click can briefly
+  // read the reverse), which showed up as a spurious CCW right after a CW turn.
+  int8_t dir = g_knob.getDirection();
+  if (dir != 0) {
+    int direction = dir > 0 ? 1 : -1;
+    noteInput(model, direction > 0 ? "KNOB CW" : "KNOB CCW");
     if (g_buttonDown) {
       g_turnedWhileDown = true;
       rotaryZoom(model, direction);
@@ -164,6 +173,7 @@ void readEncoder(Model& model) {
   if (!down && g_buttonDown) {
     g_buttonDown = false;
     if (!g_turnedWhileDown) {
+      noteInput(model, "KNOB PRESS");
       press(model);  // A quick click with no turn commits.
     }
   }
@@ -173,20 +183,22 @@ void readEncoder(Model& model) {
 
 void begin() {
   pinMode(config::PIN_SLEEP, INPUT_PULLUP);
-  pinMode(config::PIN_DISPLAY_A, INPUT_PULLUP);
-  pinMode(config::PIN_DISPLAY_B, INPUT_PULLUP);
+  pinMode(config::PIN_DISPLAY, INPUT_PULLUP);
   pinMode(config::PIN_GEO, INPUT_PULLUP);
 
-  g_encoderOk = g_encoder.begin(config::ENCODER_ADDR);
-  if (g_encoderOk) {
-    g_encoder.pinMode(SEESAW_SWITCH, INPUT_PULLUP);
-    g_lastEncoder = g_encoder.getEncoderPosition();
+  // display::begin() already ran Wire.begin(SDA=8, SCL=18) before this task
+  // starts, so the bus is up. Modulino.begin() calls the no-arg Wire.begin(),
+  // which reuses that bus — do NOT re-init Wire with different pins here.
+  Modulino.begin();
+  g_knobOk = g_knob.begin();  // Auto-discovers the Knob at 7-bit 0x3B.
+  if (g_knobOk) {
+    g_knob.set(0);  // Zero the count so getDirection() starts clean.
   }
   g_lightOk = g_light.begin(&Wire);
 }
 
 void poll(Model& model) {
-  readEncoder(model);
+  readKnob(model);
   readToggles(model);
   readLight(model);
 }

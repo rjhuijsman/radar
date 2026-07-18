@@ -7,7 +7,13 @@
 //
 // Waking from deep sleep is a fresh boot, so there is no persisted runtime
 // state to restore — `setup()` simply runs again and plays the power-on
-// bloom.
+// bloom. A cold power-up (or reset) with the key switch OFF instead shows a
+// brief "MISSING KEY" notice and goes straight back to deep sleep; the set
+// then only comes up when the key is turned on (the ext0 wake).
+//
+// The backlight is dark through all of bring-up: display::begin() leaves it
+// off, and `loop` lights it only after the first finished frame has been
+// presented, so panel-init garbage and first-paint are never seen.
 
 #include <Arduino.h>
 
@@ -20,11 +26,29 @@
 #include "Radar.h"
 #include "config.h"
 
+// Startup-latency breadcrumbs: timestamped serial lines for pinning down
+// where boot time goes (the wake-to-first-picture investigation). Flip to 0
+// once the timings are confirmed good on hardware; the [fps] probe in loop()
+// is under the same switch.
+#define BOOT_TRACE 0
+#if BOOT_TRACE
+#define BOOT_LOG(...) Serial.printf(__VA_ARGS__)
+#else
+#define BOOT_LOG(...)
+#endif
+
 namespace {
 
 model::Model g_model;
 SemaphoreHandle_t g_mutex = nullptr;
 Arduino_GFX* g_gfx = nullptr;
+
+#if BOOT_TRACE
+// Boot checkpoints, replayed once the USB console has attached (boot-time
+// prints are lost while the CDC port is still re-enumerating).
+uint32_t g_tSetupStart = 0, g_tDisplayUp = 0, g_tFirstFrame = 0,
+         g_tBloomDone = 0;
+#endif
 
 void seedDefaultHomeIfEmpty() {
   if (!g_model.homes.empty()) return;
@@ -36,6 +60,7 @@ void seedDefaultHomeIfEmpty() {
 // Core 0: read the encoder, toggles and light sensor at ~50 Hz.
 void inputsTask(void*) {
   inputs::begin();
+  BOOT_LOG("[boot] t=%6lu inputs up (core 0)\n", millis());
   for (;;) {
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     inputs::poll(g_model);
@@ -46,7 +71,10 @@ void inputsTask(void*) {
 
 // Core 0: bring up Wi-Fi and the config server, then poll the feeds.
 void networkTask(void*) {
+  BOOT_LOG("[boot] t=%6lu net::begin start (core 0)\n", millis());
   bool ok = net::begin(g_model, g_mutex);
+  BOOT_LOG("[boot] t=%6lu net::begin done, online=%d (core 0)\n", millis(),
+           ok ? 1 : 0);
   xSemaphoreTake(g_mutex, portMAX_DELAY);
   g_model.ui.online = ok;
   seedDefaultHomeIfEmpty();
@@ -94,6 +122,9 @@ void networkTask(void*) {
 
 void setup() {
   Serial.begin(115200);
+  // Never let logging slow the boot: with no USB host attached, HWCDC writes
+  // otherwise stall until a timeout once its buffer fills. Drop instead.
+  Serial.setTxTimeoutMs(0);
   delay(300);  // Let the USB-CDC console attach before the first logs.
   Serial.printf("\n\n[radar] === boot ===\n");
   Serial.printf("[radar] chip %s rev %d, %d core(s) @ %d MHz\n",
@@ -106,7 +137,15 @@ void setup() {
 
   g_mutex = xSemaphoreCreateMutex();
 
+#if BOOT_TRACE
+  g_tSetupStart = millis();
+#endif
+  BOOT_LOG("[boot] t=%6lu setup start\n", millis());
   g_gfx = display::begin();
+#if BOOT_TRACE
+  g_tDisplayUp = millis();
+#endif
+  BOOT_LOG("[boot] t=%6lu display::begin returned\n", millis());
   Serial.printf("[radar] display: %s\n",
                 g_gfx ? "up" : "FAILED (gfx=null, rendering disabled)");
   if (g_gfx != nullptr) {
@@ -116,11 +155,29 @@ void setup() {
   }
   seedDefaultHomeIfEmpty();
 
+  // The key switch is inverted: OFF is OPEN, which reads HIGH. A cold
+  // power-up (or reset) with the key off should not boot the radar: show a
+  // brief notice and go back to sleep, exactly as if the key had just been
+  // turned off. A key-turn wake reads LOW here and boots normally.
+  pinMode(config::PIN_SLEEP, INPUT_PULLUP);
+  if (digitalRead(config::PIN_SLEEP) == HIGH) {
+    BOOT_LOG("[boot] t=%6lu key is OFF: MISSING KEY, then deep sleep\n",
+             millis());
+    if (g_gfx != nullptr) {
+      radar::showMissingKey(g_gfx);  // Drawn dark; the backlight is off.
+      g_gfx->flush();                // Present it, then light the panel.
+      display::setBacklight(true);
+      delay(1500);
+    }
+    power::deepSleep();  // Does not return; the key turning on wakes us.
+  }
+
   // Every boot (cold or wake-from-sleep) opens with the power-on bloom.
   g_model.ui.screen = model::Screen::PoweringOn;
 
   xTaskCreatePinnedToCore(inputsTask, "inputs", 4096, nullptr, 3, nullptr, 0);
   xTaskCreatePinnedToCore(networkTask, "network", 8192, nullptr, 1, nullptr, 0);
+  BOOT_LOG("[boot] t=%6lu core-0 tasks created\n", millis());
   Serial.println("[radar] setup complete; core-0 tasks running.");
 }
 
@@ -145,15 +202,20 @@ void loop() {
     if (radar::renderTransition(g_gfx, g_model, animProgress, true)) {
       g_model.ui.screen = model::Screen::On;
       animProgress = 0;
-      // The transition left arbitrary content in the live buffer; make the
-      // first steady-state frame rebuild the reference and repaint in full.
-      radar::invalidate();
+      // The bloom's reveal left the live buffer matching the static
+      // reference and the renderer's bookkeeping consistent, so the scope
+      // continues incrementally — no invalidate(), whose full repaint on the
+      // scanned buffer would tear.
+#if BOOT_TRACE
+      g_tBloomDone = millis();
+#endif
+      BOOT_LOG("[boot] t=%6lu power-on bloom done; steady state\n", millis());
     }
   } else if (screen == model::Screen::PoweringOff) {
     animProgress += static_cast<float>(dt) / 720.0f;
     bool done = radar::renderTransition(g_gfx, g_model, animProgress, false);
     xSemaphoreGive(g_mutex);
-    g_gfx->flush();  // Present the collapse frame (drawing is off-screen).
+    g_gfx->flush();  // Pace the collapse to the panel refresh.
     if (done) {
       power::deepSleep();  // Does not return; wakes into a clean boot.
     }
@@ -164,4 +226,47 @@ void loop() {
   }
   xSemaphoreGive(g_mutex);
   g_gfx->flush();  // Block until the next vsync to pace the render loop.
+
+  // The backlight is dark through bring-up, so the first thing the panel
+  // ever shows is the frame just presented — never init garbage. Light it
+  // exactly once, here. (The first frame is always the bloom's opening dot:
+  // PoweringOff cannot be the first state, so its early return is safe.)
+  static bool backlightLit = false;
+  if (!backlightLit) {
+    backlightLit = true;
+    display::setBacklight(true);
+#if BOOT_TRACE
+    g_tFirstFrame = millis();
+#endif
+    BOOT_LOG("[boot] t=%6lu first frame presented; backlight on\n", millis());
+  }
+
+#if BOOT_TRACE
+  // The console usually attaches after boot (the CDC port re-enumerates on
+  // reset), so replay the whole boot timeline once, well after the fact.
+  static bool traceDumped = false;
+  if (!traceDumped && now >= 6000) {
+    traceDumped = true;
+    Serial.printf("[boot] ---- boot timeline replay ----\n");
+    Serial.printf("[boot] t=%6lu setup start\n", g_tSetupStart);
+    display::printBootTrace();
+    Serial.printf("[boot] t=%6lu display::begin returned\n", g_tDisplayUp);
+    Serial.printf("[boot] t=%6lu first frame presented; backlight on\n",
+                  g_tFirstFrame);
+    Serial.printf("[boot] t=%6lu power-on bloom done\n", g_tBloomDone);
+  }
+
+  // Render-rate probe: proves the steady state still paces at the panel's
+  // ~25 Hz refresh. Goes away with BOOT_TRACE.
+  static uint32_t fpsStart = 0;
+  static uint16_t fpsFrames = 0;
+  ++fpsFrames;
+  if (now - fpsStart >= 5000) {
+    if (fpsStart != 0) {
+      BOOT_LOG("[fps] %.1f\n", fpsFrames * 1000.0f / (now - fpsStart));
+    }
+    fpsStart = now;
+    fpsFrames = 0;
+  }
+#endif
 }

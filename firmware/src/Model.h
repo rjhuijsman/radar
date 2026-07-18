@@ -58,8 +58,8 @@ struct Feed {
   bool enabled = true;
 };
 
-// The 3-way Display toggle: which layers are drawn.
-enum class DisplayMode { Flights, Both, Weather };
+// The 2-position Display toggle: flights layer or weather layer.
+enum class DisplayMode { Flights, Weather };
 
 // Screen power, including the transition animations.
 enum class Screen { On, PoweringOff, Off, PoweringOn };
@@ -67,7 +67,7 @@ enum class Screen { On, PoweringOff, Off, PoweringOn };
 // Transient interaction state driven by the encoder and toggles.
 struct Ui {
   float range = 40.0f;         // Current display range in NM.
-  DisplayMode display = DisplayMode::Both;
+  DisplayMode display = DisplayMode::Flights;
   bool geography = false;      // Geography overlay on/off.
   Screen screen = Screen::On;
 
@@ -83,6 +83,9 @@ struct Ui {
   float brightness = 1.0f;     // Ambient-light dimming scalar.
   bool otaActive = false;      // An OTA update is in progress; defer sleep.
   bool online = false;         // Wi-Fi associated; false shows "acquiring".
+
+  String lastInput;            // Last control event, flashed as a wiring test.
+  uint32_t lastInputMs = 0;    // millis() when lastInput was recorded.
 };
 
 // The whole shared world plus UI state.

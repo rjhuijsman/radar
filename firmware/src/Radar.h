@@ -31,18 +31,21 @@ void step(model::Model& model, uint32_t dtMs);
 void renderIncremental(model::Model& model);
 
 // Forces the next incremental frame to rebuild the static reference and
-// repaint the whole live buffer. Call when returning to the live scope from a
-// power on/off transition, which leaves arbitrary content in the live buffer.
+// repaint the whole live buffer. Call when the live buffer's content can no
+// longer be trusted to match the renderer's bookkeeping.
 void invalidate();
-
-// Draws one full frame of the live scope into `gfx`. Used by the transitions;
-// the steady-state loop uses renderIncremental() instead.
-void renderScene(Arduino_GFX* gfx, model::Model& model);
 
 // Draws one frame of the power on/off CRT animation. `progress` runs 0..1;
 // `poweringOn` selects the bloom (true) or the collapse (false). Returns
-// true once the animation has completed.
+// true once the animation has completed. Both animations are incremental —
+// each frame writes only a small delta of the shared framebuffer, so they
+// cannot tear against the panel scan — and the bloom's reveal leaves the
+// renderer in a consistent state, so no invalidate() is needed after it.
 bool renderTransition(Arduino_GFX* gfx, model::Model& model, float progress,
                       bool poweringOn);
+
+// Draws the full-screen "MISSING KEY" notice shown when the set boots with
+// the key switch off, just before it goes back to deep sleep.
+void showMissingKey(Arduino_GFX* gfx);
 
 }  // namespace radar

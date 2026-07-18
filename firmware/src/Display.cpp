@@ -7,6 +7,16 @@
 
 #include "config.h"
 
+// Startup-latency breadcrumbs: timestamped serial lines for pinning down
+// where boot time goes (the wake-to-first-picture investigation). Flip to 0
+// once the timings are confirmed good on hardware.
+#define BOOT_TRACE 0
+#if BOOT_TRACE
+#define BOOT_LOG(...) Serial.printf(__VA_ARGS__)
+#else
+#define BOOT_LOG(...)
+#endif
+
 namespace display {
 namespace {
 
@@ -29,6 +39,23 @@ StaticGfx* g_static = nullptr;
 uint16_t* g_liveFb = nullptr;
 uint16_t* g_staticFb = nullptr;
 
+// Boot-trace checkpoints recorded during begin(). They are also printed
+// immediately, but the USB console usually attaches after boot (the CDC port
+// re-enumerates on reset), so printBootTrace() replays them later.
+struct BootMark {
+  const char* what;
+  uint32_t t;
+};
+BootMark g_bootMarks[8];
+int g_bootMarkCount = 0;
+
+void mark(const char* what) {
+  if (g_bootMarkCount < 8) {
+    g_bootMarks[g_bootMarkCount++] = BootMark{what, millis()};
+  }
+  BOOT_LOG("[boot] t=%6lu display: %s\n", millis(), what);
+}
+
 // Fires from the RGB driver ISR at each VSYNC. Waking the render task here
 // paces one rendered frame per panel refresh (~24.6 Hz) with no busy-wait.
 bool IRAM_ATTR onVsync(esp_lcd_panel_handle_t,
@@ -44,11 +71,25 @@ Arduino_GFX* begin() {
   g_renderTask = xTaskGetCurrentTaskHandle();  // The core-1 render loop.
 
   Wire.begin(config::I2C_SDA, config::I2C_SCL);
+  // Run the bus at Fast-mode for bring-up. Every bit of the bit-banged panel
+  // init below costs a whole I2C write to the expander, so the bus clock is
+  // the panel init's clock: 100 kHz put multiple seconds between wake and
+  // first picture. The PCA9554 is a 400 kHz part. (Modulino.begin() later
+  // drops the bus back to 100 kHz for steady-state input polling.)
+  Wire.setClock(400000);
 
+  mark("begin start");
   g_expander = new Arduino_XCA9554SWSPI(
       config::EXP_TFT_RESET, config::EXP_TFT_CS, config::EXP_TFT_SCK,
       config::EXP_TFT_MOSI, &Wire, config::EXPANDER_ADDR);
   g_expander->begin();
+
+  // The expander's begin() releases every pin to input, which lets the
+  // backlight line float on with the panel still unconfigured — the lit
+  // blank/garbage screen seen on wake. Drive it low again immediately;
+  // main.cpp lights it only after the first frame has been presented.
+  setBacklight(false);
+  mark("expander up, backlight held off");
 
   // Configure the HD40015C40 controller over the expander's bit-banged SPI,
   // exactly as Arduino_RGB_Display would when no reset pin is wired: software
@@ -56,8 +97,10 @@ Arduino_GFX* begin() {
   // NV3052C — not ST7701). `hd40015c40_init_operations` ships in Arduino_GFX.
   g_expander->sendCommand(0x01);  // Software reset.
   delay(120);
+  mark("panel-controller init start (bit-banged SPI)");
   g_expander->batchOperation((uint8_t*)hd40015c40_init_operations,
                              sizeof(hd40015c40_init_operations));
+  mark("panel-controller init done");
 
   // A SINGLE framebuffer in PSRAM (no flip) plus a bounce buffer so the LCD
   // FIFO refills from internal SRAM and cannot underrun when PSRAM is busy.
@@ -158,12 +201,20 @@ Arduino_GFX* begin() {
       "[display] panel up: %dx%d, single-fb, dirty-rect, vsync-paced.\n",
       config::PANEL_WIDTH, config::PANEL_HEIGHT);
 
-  // Clear the scanned buffer before the backlight comes on. There is no flip:
-  // these writes are what the panel shows.
+  // Clear the scanned buffer while the backlight is still dark. There is no
+  // flip: these writes are what the panel shows. The backlight stays off
+  // until main.cpp has presented a first finished frame, so bring-up and
+  // first-paint are never visible.
   g_live->fillScreen(RGB565_BLACK);
-
-  setBacklight(true);
+  mark("RGB peripheral up, buffer cleared");
   return g_live;
+}
+
+void printBootTrace() {
+  for (int i = 0; i < g_bootMarkCount; ++i) {
+    Serial.printf("[boot] t=%6lu display: %s\n", g_bootMarks[i].t,
+                  g_bootMarks[i].what);
+  }
 }
 
 LiveGfx* live() { return g_live; }

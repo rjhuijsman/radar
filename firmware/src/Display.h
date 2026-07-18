@@ -103,7 +103,9 @@ class LiveGfx : public Arduino_Canvas {
 };
 
 // Brings up the RGB-666 panel. Returns the live GFX surface everything draws
-// onto, or nullptr if initialization failed. Call once from `setup()`.
+// onto, or nullptr if initialization failed. Call once from `setup()`. The
+// backlight is left OFF: the caller lights it (setBacklight) only after a
+// first finished frame has been presented, so bring-up is never visible.
 Arduino_GFX* begin();
 
 // Accessors for the two surfaces and their raw framebuffers, used by the
@@ -119,5 +121,10 @@ int16_t height();
 // Turns the panel backlight on or off via the expander. I2C must still be
 // alive, so call this before `esp_deep_sleep_start()`, never after.
 void setBacklight(bool on);
+
+// Replays the timestamped bring-up checkpoints recorded during begin().
+// Boot-time serial output is lost when no USB host is attached yet (the CDC
+// port re-enumerates on reset), so main.cpp calls this once, later.
+void printBootTrace();
 
 }  // namespace display
