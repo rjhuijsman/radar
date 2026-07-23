@@ -83,8 +83,13 @@ Arduino_GFX* begin() {
   Wire.setClock(400000);
 
   mark("begin start");
+  // Pass no reset pin (GFX_NOT_DEFINED): the library's begin() would pulse the
+  // panel reset while every expander pin — the backlight among them — is still
+  // floating high, so its 10+100 ms reset delay shows as a lit blank screen
+  // for ~110 ms on every power-up and wake. We drive the backlight off first
+  // and pulse EXP_TFT_RESET ourselves, below, in the dark.
   g_expander = new Arduino_XCA9554SWSPI(
-      config::EXP_TFT_RESET, config::EXP_TFT_CS, config::EXP_TFT_SCK,
+      GFX_NOT_DEFINED, config::EXP_TFT_CS, config::EXP_TFT_SCK,
       config::EXP_TFT_MOSI, &Wire, config::EXPANDER_ADDR);
   g_expander->begin();
 
@@ -93,7 +98,16 @@ Arduino_GFX* begin() {
   // blank/garbage screen seen on wake. Drive it low again immediately;
   // main.cpp lights it only after the first frame has been presented.
   setBacklight(false);
-  mark("expander up, backlight held off");
+
+  // Now pulse the panel's hardware reset ourselves — in the dark, backlight
+  // held off — the same 10/100 ms pulse begin() would have done, minus the
+  // blink. EXP_TFT_RESET is still an input after begin(); drive it.
+  g_expander->pinMode(config::EXP_TFT_RESET, OUTPUT);
+  g_expander->digitalWrite(config::EXP_TFT_RESET, LOW);
+  delay(10);
+  g_expander->digitalWrite(config::EXP_TFT_RESET, HIGH);
+  delay(100);
+  mark("expander up, backlight off, panel reset");
 
   // Configure the HD40015C40 controller over the expander's bit-banged SPI,
   // exactly as Arduino_RGB_Display would when no reset pin is wired: software
@@ -132,7 +146,7 @@ Arduino_GFX* begin() {
                       .hsync_idle_low = 0,
                       .vsync_idle_low = 0,
                       .de_idle_high = 0,
-                      .pclk_active_neg = 0,
+                      .pclk_active_neg = 1,
                       .pclk_idle_high = 0,
                   },
           },

@@ -16,6 +16,7 @@
 // presented, so panel-init garbage and first-paint are never seen.
 
 #include <Arduino.h>
+#include <esp_system.h>  // esp_reset_reason(): cold power-up vs. deep-sleep wake.
 
 #include "Display.h"
 #include "Feeds.h"
@@ -146,6 +147,51 @@ void setup() {
   // Never let logging slow the boot: with no USB host attached, HWCDC writes
   // otherwise stall until a timeout once its buffer fills. Drop instead.
   Serial.setTxTimeoutMs(0);
+
+  // Is this boot a wake from our own deep sleep (the key being turned on),
+  // rather than a cold power-up or reset? A mechanical key bounces as it
+  // opens, and each bounce can re-trigger the ext0 wake; we use this below to
+  // keep the "MISSING KEY" notice to genuine power-ups and re-sleep silently
+  // on a bounce.
+  bool wokeFromSleep = (esp_reset_reason() == ESP_RST_DEEPSLEEP);
+
+#if BOOT_TRACE
+  g_tSetupStart = millis();
+#endif
+  // Bring the panel up first thing, ahead of the console-settle delay and the
+  // boot banner below. The expander powers up with the backlight line
+  // floating on, and display::begin() is what drives it off, so the sooner it
+  // runs the shorter that float. The backlight then stays dark until loop()
+  // presents the first finished frame.
+  g_gfx = display::begin();
+#if BOOT_TRACE
+  g_tDisplayUp = millis();
+#endif
+  BOOT_LOG("[boot] t=%6lu display::begin returned\n", millis());
+  if (g_gfx != nullptr) {
+    radar::beginRenderer(display::live(), display::staticRef(),
+                         display::staticFb(), display::width(),
+                         display::height());
+  }
+
+  // The key switch is inverted: OFF is OPEN, which reads HIGH. A cold
+  // power-up (or reset) with the key off should not boot the radar: show a
+  // brief notice, then sleep until the key is turned on. A wake that still
+  // reads OFF is only contact bounce on the off-transition re-triggering the
+  // ext0 wake — re-sleep silently and dark, with no notice.
+  pinMode(config::PIN_SLEEP, INPUT_PULLUP);
+  if (digitalRead(config::PIN_SLEEP) == HIGH) {
+    if (!wokeFromSleep && g_gfx != nullptr) {
+      BOOT_LOG("[boot] t=%6lu cold boot, key OFF: MISSING KEY then sleep\n",
+               millis());
+      radar::showMissingKey(g_gfx);  // Drawn dark; light the panel to show it.
+      g_gfx->flush();
+      display::setBacklight(true);
+      delay(1500);
+    }
+    power::deepSleep();  // Does not return; the key turning on wakes us.
+  }
+
   delay(300);  // Let the USB-CDC console attach before the first logs.
   Serial.printf("\n\n[radar] === boot ===\n");
   Serial.printf("[radar] chip %s rev %d, %d core(s) @ %d MHz\n",
@@ -155,43 +201,11 @@ void setup() {
                 ESP.getFlashChipSize() / (1024 * 1024),
                 ESP.getFreePsram() / 1024, ESP.getPsramSize() / 1024,
                 ESP.getFreeHeap() / 1024);
-
-  g_mutex = xSemaphoreCreateMutex();
-
-#if BOOT_TRACE
-  g_tSetupStart = millis();
-#endif
-  BOOT_LOG("[boot] t=%6lu setup start\n", millis());
-  g_gfx = display::begin();
-#if BOOT_TRACE
-  g_tDisplayUp = millis();
-#endif
-  BOOT_LOG("[boot] t=%6lu display::begin returned\n", millis());
   Serial.printf("[radar] display: %s\n",
                 g_gfx ? "up" : "FAILED (gfx=null, rendering disabled)");
-  if (g_gfx != nullptr) {
-    radar::beginRenderer(display::live(), display::staticRef(),
-                         display::staticFb(), display::width(),
-                         display::height());
-  }
-  seedDefaultHomeIfEmpty();
 
-  // The key switch is inverted: OFF is OPEN, which reads HIGH. A cold
-  // power-up (or reset) with the key off should not boot the radar: show a
-  // brief notice and go back to sleep, exactly as if the key had just been
-  // turned off. A key-turn wake reads LOW here and boots normally.
-  pinMode(config::PIN_SLEEP, INPUT_PULLUP);
-  if (digitalRead(config::PIN_SLEEP) == HIGH) {
-    BOOT_LOG("[boot] t=%6lu key is OFF: MISSING KEY, then deep sleep\n",
-             millis());
-    if (g_gfx != nullptr) {
-      radar::showMissingKey(g_gfx);  // Drawn dark; the backlight is off.
-      g_gfx->flush();                // Present it, then light the panel.
-      display::setBacklight(true);
-      delay(1500);
-    }
-    power::deepSleep();  // Does not return; the key turning on wakes us.
-  }
+  g_mutex = xSemaphoreCreateMutex();
+  seedDefaultHomeIfEmpty();
 
   // Every boot (cold or wake-from-sleep) opens with the power-on bloom.
   g_model.ui.screen = model::Screen::PoweringOn;

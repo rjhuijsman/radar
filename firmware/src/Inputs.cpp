@@ -122,19 +122,19 @@ void press(Model& model) {
 }
 
 void readToggles(Model& model) {
-  // 2-position Display toggle: closed (LOW) selects Weather, open (HIGH)
-  // selects Flights. The polarity is trivially flipped by swapping the two
-  // modes here. Note only on an actual change, so it does not spam the poll.
+  // 2-position Display toggle: closed (LOW) selects Flights, open (HIGH)
+  // selects Weather. Note only on an actual change, so it does not spam the
+  // poll.
   DisplayMode display = digitalRead(config::PIN_DISPLAY) == LOW
-                            ? DisplayMode::Weather
-                            : DisplayMode::Flights;
+                            ? DisplayMode::Flights
+                            : DisplayMode::Weather;
   if (display != model.ui.display) {
     model.ui.display = display;
     noteInput(model, display == DisplayMode::Weather ? "DISPLAY: WEATHER"
                                                      : "DISPLAY: FLIGHTS");
   }
 
-  bool geo = digitalRead(config::PIN_GEO) == LOW;
+  bool geo = digitalRead(config::PIN_GEO) == HIGH;
   if (geo != model.ui.geography) {
     model.ui.geography = geo;
     noteInput(model, geo ? "GEOGRAPHY: ON" : "GEOGRAPHY: OFF");
