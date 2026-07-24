@@ -56,8 +56,12 @@ uint16_t tickColor(const Model& model) {
 }
 
 const float kCenterX = config::PANEL_WIDTH / 2.0f;
-const float kCenterY = config::PANEL_HEIGHT / 2.0f;
-const float kRadius = config::PANEL_WIDTH * 0.46f;
+// The scope is nudged down from a true centre and the ring shrunk a little,
+// so the top of the dial (the "N" and outer ring) clears the case bezel that
+// covers the topmost strip of the panel as mounted. The whole image projects
+// through these, so it shifts and scales together and stays round.
+const float kCenterY = config::PANEL_HEIGHT / 2.0f + 10.0f;
+const float kRadius = config::PANEL_WIDTH * 0.435f;
 
 // Scales an RGB565 color by the current brightness, for ambient dimming.
 uint16_t dim(uint16_t color, float k) {
