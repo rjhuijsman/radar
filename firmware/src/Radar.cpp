@@ -18,7 +18,11 @@ using model::DisplayMode;
 using model::Model;
 using model::Vec;
 
-constexpr float kSweepPersistenceMs = 2600.0f;
+// Blips fade from full brightness to the dim floor linearly over most of a
+// sweep rotation, hitting the floor just before the sweep swings back around
+// to repaint them — a slow phosphor afterglow instead of a quick blink.
+// Expressed as a fraction of one sweep period (config::SWEEP_PERIOD_MS).
+constexpr float kBlipFadeSpan = 0.92f;
 constexpr float kPanTauMs = 300.0f;
 // Easing constant for the followed flight's displayed position; long
 // enough that a fix's correction glides in, short enough to feel live.
@@ -1325,11 +1329,12 @@ void step(Model& model, uint32_t dtMs) {
   // sweep reaching top — one rotation, one poll.
   if (model.ui.sweepAngle < previous) model.adsbPollDue = true;
 
-  float decay = expf(-dt / kSweepPersistenceMs);
+  float fadeStep = dt / (config::SWEEP_PERIOD_MS * kBlipFadeSpan);
 
   for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
     Aircraft& ac = model.aircraft[i];
-    ac.freshness *= decay;
+    ac.freshness -= fadeStep;
+    if (ac.freshness < 0.0f) ac.freshness = 0.0f;
     if (swept(previous, model.ui.sweepAngle, bearingFrom(model, ac.pos))) {
       ac.shown = ac.pos;
       ac.seen = true;
