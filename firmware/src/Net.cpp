@@ -65,6 +65,12 @@ void configToJson(const model::Model& model, JsonDocument& doc,
     object["color"] = feed.color;
     object["enabled"] = feed.enabled;
   }
+  JsonArray specials = doc["specials"].to<JsonArray>();
+  for (const auto& s : model.specials) {
+    JsonObject object = specials.add<JsonObject>();
+    object["flight"] = s.flight;
+    object["date"] = s.date;
+  }
   JsonArray wifi = doc["wifi"].to<JsonArray>();
   for (const auto& network : model.wifi) {
     JsonObject object = wifi.add<JsonObject>();
@@ -114,6 +120,14 @@ void jsonToConfig(const JsonDocument& doc, model::Model& model) {
     feed.color = object["color"] | 0;
     feed.enabled = object["enabled"] | true;
     model.feeds.push_back(feed);
+  }
+
+  model.specials.clear();
+  for (JsonObjectConst object : doc["specials"].as<JsonArrayConst>()) {
+    model::SpecialFlight s;
+    s.flight = object["flight"] | "";
+    s.date = object["date"] | "";
+    if (s.flight.length() > 0) model.specials.push_back(s);
   }
 
   // Wi-Fi networks: merge rather than replace. Reads never expose the
@@ -243,6 +257,8 @@ void startServices() {
   Serial.printf("[net] Wi-Fi up: SSID '%s', IP %s, http://%s.local/\n",
                 WiFi.SSID().c_str(), WiFi.localIP().toString().c_str(),
                 config::MDNS_HOST);
+  // Start SNTP (UTC) so special flights can be matched to today's date.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
   setupOta();
   routes();
   g_server.begin();

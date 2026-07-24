@@ -65,6 +65,14 @@ struct Feed {
   bool enabled = true;
 };
 
+// A manually-entered special flight: a flight number and the date it flies.
+// Highlighted only on that date, exactly like the iCal-matched ones — just
+// another way to supply a flight-number + date pair.
+struct SpecialFlight {
+  String flight;  // As entered, e.g. "BA117" or "KL 1234".
+  String date;    // YYYY-MM-DD; highlighted only on this date.
+};
+
 // A remembered Wi-Fi network. The set keeps several and joins whichever
 // is in range (see net::begin). Persisted in the config file; the web
 // API accepts the password on writes but never reads it back out.
@@ -136,6 +144,7 @@ struct Model {
   std::vector<Poi> pois;
   std::vector<Home> homes;
   std::vector<Feed> feeds;
+  std::vector<SpecialFlight> specials;  // Manually-entered special flights.
   std::vector<WifiNetwork> wifi;
   WeatherLayer weather;
 

@@ -8,6 +8,7 @@
 
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <time.h>
 
 #include <algorithm>
 #include <new>
@@ -687,42 +688,130 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   return true;
 }
 
+// Today's date in UTC as YYYYMMDD, or "" until NTP has set the clock. Special
+// flights (manual and iCal) are matched only on their own date, so with no
+// clock yet nothing is flagged rather than risk a wrong-day highlight.
+String todayUtc() {
+  time_t t = time(nullptr);
+  if (t < 1600000000L) return "";  // Before 2020-09: clock not NTP-synced yet.
+  struct tm utc;
+  gmtime_r(&t, &utc);
+  char buf[9];
+  strftime(buf, sizeof(buf), "%Y%m%d", &utc);
+  return String(buf);
+}
+
+// Strips separators so "2026-07-25" and "20260725" compare equal.
+String digitsOnly(const String& s) {
+  String out;
+  for (int i = 0; i < static_cast<int>(s.length()); ++i) {
+    if (isdigit(s[i])) out += s[i];
+  }
+  return out;
+}
+
+// The date of an iCal VEVENT from its DTSTART (YYYYMMDD), or "" if absent.
+// Handles DTSTART:..., DTSTART;VALUE=DATE:..., DTSTART;TZID=...: forms — the
+// date is the run of digits right after the first ':' following DTSTART.
+String eventDate(const String& event) {
+  int d = event.indexOf("DTSTART");
+  if (d < 0) return "";
+  int colon = event.indexOf(':', d);
+  if (colon < 0) return "";
+  String date;
+  for (int i = colon + 1;
+       i < static_cast<int>(event.length()) && date.length() < 8; ++i) {
+    if (!isdigit(event[i])) break;
+    date += event[i];
+  }
+  return date.length() == 8 ? date : "";
+}
+
+// Scans free text for airline-code + number designators (e.g. "BA 117") and
+// inserts the ICAO callsign the ADS-B feed broadcasts (e.g. "BAW117").
+void scanFlights(const String& text, std::set<String>& out) {
+  int n = static_cast<int>(text.length());
+  for (int i = 0; i + 2 < n; ++i) {
+    char a = text[i], b = text[i + 1];
+    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') continue;
+    int j = i + 2;
+    while (j < n && text[j] == ' ') ++j;
+    if (j >= n || !isdigit(text[j])) continue;
+    String number;
+    while (j < n && isdigit(text[j])) number += text[j++];
+    if (number.length() < 2 || number.length() > 4) continue;
+    String icao = iataToIcao(String(a) + String(b));
+    if (!icao.isEmpty()) out.insert(icao + number);
+  }
+}
+
+// Adds the callsign forms a manually-entered flight number could broadcast
+// as: the ICAO airline prefix + number, and the raw entry, so an ICAO
+// callsign typed directly (e.g. "BAW117") also matches.
+void addManualFlight(const String& flight, std::set<String>& out) {
+  String code, number;
+  for (int i = 0; i < static_cast<int>(flight.length()); ++i) {
+    char c = toupper(flight[i]);
+    if (isalpha(c) && number.isEmpty()) {
+      code += c;
+    } else if (isdigit(c)) {
+      number += c;
+    }
+  }
+  if (number.length() < 2 || number.length() > 4) return;
+  if (code.length() == 2) {
+    String icao = iataToIcao(code);
+    if (!icao.isEmpty()) out.insert(icao + number);
+  }
+  if (code.length() >= 2) out.insert(code + number);  // Raw / already-ICAO.
+}
+
 int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
-  // Copy the enabled feed URLs out under the mutex; the fetches below run
-  // with no lock held.
+  // Copy the enabled feed URLs and the manual specials out under the mutex;
+  // the fetches below run with no lock held.
   std::vector<String> urls;
+  std::vector<model::SpecialFlight> manual;
   xSemaphoreTake(mutex, portMAX_DELAY);
   for (const auto& feed : model.feeds) {
     if (feed.enabled) urls.push_back(feed.url);
   }
+  manual = model.specials;
   xSemaphoreGive(mutex);
 
+  // Both manual and iCal specials highlight only on their own date, so
+  // without the clock (NTP not yet synced) nothing is flagged.
+  String today = todayUtc();
+
   std::set<String> found;
+
+  // Manually-entered specials due today.
+  if (!today.isEmpty()) {
+    for (const auto& s : manual) {
+      if (digitsOnly(s.date) == today) addManualFlight(s.flight, found);
+    }
+  }
+
+  // iCal feeds: parse VEVENTs and keep only flights whose DTSTART is today.
   int fetched = 0;
   for (const auto& url : urls) {
     String body;
     if (!httpGet(url, body)) continue;
     ++fetched;
-
-    // Heuristic extraction: scan for an IATA airline code followed by a
-    // flight number (e.g. "BA 117") and convert to the ICAO callsign the
-    // ADS-B feed broadcasts. TODO(feeds): unfold iCal lines, respect
-    // VEVENT boundaries, and filter to flights happening today.
-    for (int i = 0; i + 2 < static_cast<int>(body.length()); ++i) {
-      char a = body[i], b = body[i + 1];
-      if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') continue;
-      int j = i + 2;
-      while (j < static_cast<int>(body.length()) && body[j] == ' ') ++j;
-      if (j >= static_cast<int>(body.length()) || !isdigit(body[j])) continue;
-      String number;
-      while (j < static_cast<int>(body.length()) && isdigit(body[j])) {
-        number += body[j++];
-      }
-      if (number.length() < 2 || number.length() > 4) continue;
-      String icao = iataToIcao(String(a) + String(b));
-      if (!icao.isEmpty()) found.insert(icao + number);
+    if (today.isEmpty()) continue;  // No clock: cannot date-filter safely.
+    body.replace("\r\n ", "");       // Unfold folded iCal content lines.
+    body.replace("\n ", "");
+    int idx = 0;
+    while (true) {
+      int evStart = body.indexOf("BEGIN:VEVENT", idx);
+      if (evStart < 0) break;
+      int evEnd = body.indexOf("END:VEVENT", evStart);
+      if (evEnd < 0) evEnd = static_cast<int>(body.length());
+      idx = evEnd + 1;
+      String event = body.substring(evStart, evEnd);
+      if (eventDate(event) == today) scanFlights(event, found);
     }
   }
+
   g_specials = found;
   return fetched;
 }
