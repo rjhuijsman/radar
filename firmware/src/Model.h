@@ -119,6 +119,14 @@ struct Ui {
   String lastInput;            // Last control event, flashed as a wiring test.
   uint32_t lastInputMs = 0;    // millis() when lastInput was recorded.
   uint32_t lastZoomMs = 0;     // Last zoom detent; emphasizes the range readout.
+
+  std::vector<Vec> followTrail;  // Recent smoothed positions of the followed
+                                 // flight (world NM from home), drawn as a
+                                 // dotted past-path trail; cleared per follow.
+  uint32_t lastTrailMs = 0;      // millis() of the last trail sample.
+  String pausedFollow;           // Callsign to auto-resume following on return
+                                 // to flights mode; set on entering weather,
+                                 // cleared by a deliberate go-home. Empty=none.
 };
 
 // The whole shared world plus UI state.

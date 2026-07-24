@@ -4,6 +4,7 @@
 #include <Modulino.h>
 #include <Wire.h>
 
+#include <algorithm>
 #include <vector>
 
 #include "Feeds.h"
@@ -54,6 +55,8 @@ void startFollow(Model& model, int aircraftIndex) {
   model.ui.followIndex = aircraftIndex;
   model.ui.candidate = -2;
   model.ui.browseSel = -1;
+  model.ui.followTrail.clear();  // Fresh trail for the newly followed flight.
+  model.ui.pausedFollow = "";    // Actively following now; nothing to resume.
   // Start the smoothed display position where the blip is drawn right now
   // (the sweep-painted spot), so the follow glides from there to the live
   // dead-reckoned track instead of jumping.
@@ -66,19 +69,51 @@ void goHome(Model& model) {
   model.ui.followIndex = -1;
   model.ui.candidate = -2;
   model.ui.browseSel = -1;
+  model.ui.followTrail.clear();
+  model.ui.pausedFollow = "";  // A deliberate go-home cancels any paused follow.
+}
+
+// Resume the follow paused when weather mode was entered, if that flight is
+// still present; otherwise clear the pending resume.
+void resumeFollow(Model& model) {
+  for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
+    if (model.aircraft[i].callsign == model.ui.pausedFollow) {
+      startFollow(model, i);  // Clears pausedFollow.
+      return;
+    }
+  }
+  model.ui.pausedFollow = "";  // Gone from range; nothing to resume.
+}
+
+// Aircraft indices in browse order: special (iCal/TripIt-matched) flights
+// first, then by distance from home, nearest first. The world is measured
+// from the active home at the origin, so `pos` magnitude is the home range.
+std::vector<int> browseOrder(const Model& model) {
+  std::vector<int> order;
+  for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
+    order.push_back(i);
+  }
+  std::sort(order.begin(), order.end(), [&](int a, int b) {
+    const model::Aircraft& A = model.aircraft[a];
+    const model::Aircraft& B = model.aircraft[b];
+    if (A.special != B.special) return A.special;  // Specials lead.
+    float da = A.pos.x * A.pos.x + A.pos.y * A.pos.y;  // Distance² from home.
+    float db = B.pos.x * B.pos.x + B.pos.y * B.pos.y;
+    return da < db;  // Nearer first.
+  });
+  return order;
 }
 
 // One detent turn while browsing (encoder not held).
 void rotarySelect(Model& model, int direction) {
-  int count = static_cast<int>(model.aircraft.size());
   if (!model.ui.following) {
     std::vector<int> list = {-1};  // -1 = no target selected.
-    for (int i = 0; i < count; ++i) list.push_back(i);
+    for (int i : browseOrder(model)) list.push_back(i);
     model.ui.browseSel = stepInList(model.ui.browseSel, direction, list);
     g_lastBrowseMs = millis();  // Arms the back-to-no-selection timeout.
   } else {
     std::vector<int> list = {-2};  // -2 = no candidate.
-    for (int i = 0; i < count; ++i) list.push_back(i);
+    for (int i : browseOrder(model)) list.push_back(i);
     list.push_back(-1);  // -1 = the Home entry.
     model.ui.candidate = stepInList(model.ui.candidate, direction, list);
   }
@@ -107,6 +142,7 @@ void press(Model& model) {
       // POIs re-derive from their stored lat/lng right here.
       model.aircraft.clear();
       model.ui.candidate = -2;
+      model.ui.pausedFollow = "";  // Going home cancels any paused follow.
       feeds::reprojectStatics(model);
       model.adsbPollDue = true;
       noteInput(model, (String("HOME: ") +
@@ -130,6 +166,21 @@ void readToggles(Model& model) {
                             : DisplayMode::Weather;
   if (display != model.ui.display) {
     model.ui.display = display;
+    if (display == DisplayMode::Weather && model.ui.following) {
+      // Weather pauses tracking: remember the flight and let the map settle
+      // home-static. Returning to flights resumes it (unless the user goes
+      // home in the meantime, which clears pausedFollow).
+      String cs;
+      if (model.ui.followIndex >= 0 &&
+          model.ui.followIndex < static_cast<int>(model.aircraft.size())) {
+        cs = model.aircraft[model.ui.followIndex].callsign;
+      }
+      goHome(model);              // Stop following (also clears pausedFollow);
+      model.ui.pausedFollow = cs;  // remember it (empty stale index won't resume).
+    } else if (display == DisplayMode::Flights &&
+               model.ui.pausedFollow.length() > 0) {
+      resumeFollow(model);
+    }
     noteInput(model, display == DisplayMode::Weather ? "DISPLAY: WEATHER"
                                                      : "DISPLAY: FLIGHTS");
   }

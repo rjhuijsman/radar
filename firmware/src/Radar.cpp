@@ -27,6 +27,10 @@ constexpr float kPanTauMs = 300.0f;
 // Easing constant for the followed flight's displayed position; long
 // enough that a fix's correction glides in, short enough to feel live.
 constexpr float kFollowTauMs = 1200.0f;
+// The followed flight's past path: sample its smoothed position this often
+// into a bounded trail, drawn as a dotted line behind it.
+constexpr uint32_t kTrailSampleMs = 1500;
+constexpr int kTrailMaxPoints = 40;  // ~kTrailMaxPoints * kTrailSampleMs of path.
 
 constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
@@ -747,6 +751,7 @@ struct StaticSig {
   int8_t home = 0;         // Active home (geography anchor, name label).
   uint8_t emph = 0;        // Range readout emphasized (recent zoom detent).
   uint32_t wxGen = 0;      // Weather layer generation, while it is drawn.
+  int16_t trail = 0;       // Followed-flight trail length (grows as it flies).
 };
 StaticSig g_sig;
 
@@ -765,12 +770,6 @@ FbState g_fb[2];
 int16_t g_curSweepX = 0, g_curSweepY = 0;
 bool g_curHaveSweep = false;  // This frame drew a sweep (offline suppresses it).
 
-// View-center pinning while following: the view recenters (an expensive
-// panning rebuild) only once the followed flight has drifted well off
-// center, and the pan latches until it has converged again. Between
-// recenters the view is static and the blip glides across it.
-bool g_recentering = false;
-
 // Offline-to-online handoff: when signal is acquired, the amber title
 // fades out and the sweep fades in over these windows, so the switch to
 // the live scope is a dissolve rather than a hard cut.
@@ -783,7 +782,7 @@ bool sigEqual(const StaticSig& a, const StaticSig& b) {
   return a.range100 == b.range100 && a.cx == b.cx && a.cy == b.cy &&
          a.mode == b.mode && a.geo == b.geo && a.bright == b.bright &&
          a.online == b.online && a.home == b.home && a.emph == b.emph &&
-         a.wxGen == b.wxGen;
+         a.wxGen == b.wxGen && a.trail == b.trail;
 }
 
 StaticSig staticSigOf(const Model& model) {
@@ -806,6 +805,7 @@ StaticSig staticSigOf(const Model& model) {
   if (model.ui.online && showWeather(model) && weatherUsable(model)) {
     s.wxGen = model.weather.generation;
   }
+  s.trail = static_cast<int16_t>(model.ui.followTrail.size());
   return s;
 }
 
@@ -917,6 +917,42 @@ void drawRangeReadout(Arduino_GFX* gfx, const Model& model) {
 // metalwork, geography and labels all read over it (the mockup's
 // layering; the sweep and blips draw over everything later). It is
 // suppressed while offline, keeping the acquiring-signal screen clean.
+// The followed flight's recent path, as a dotted line trailing behind it.
+// World-anchored like the geography, so it lives in the static scene and
+// scrolls with the view as the map tracks the flight.
+void drawFollowTrail(Arduino_GFX* gfx, const Model& model) {
+  const auto& trail = model.ui.followTrail;
+  if (trail.size() < 2) return;
+  bool special = model.ui.followIndex >= 0 &&
+                 model.ui.followIndex <
+                     static_cast<int>(model.aircraft.size()) &&
+                 model.aircraft[model.ui.followIndex].special;
+  uint16_t c = dim(special ? C_AMBER : C_GREEN, model.ui.brightness * 0.7f);
+  float r2 = kRadius * kRadius;
+  float px = 0, py = 0;
+  bool have = false;
+  for (size_t i = 0; i < trail.size(); ++i) {
+    float x, y;
+    project(model, trail[i], x, y);
+    if (have) {  // A 3 px dot every ~7 px along the segment, inside the scope.
+      float dx = x - px, dy = y - py;
+      int steps = static_cast<int>(sqrtf(dx * dx + dy * dy) / 7.0f);
+      for (int s = 1; s <= steps; ++s) {
+        float t = static_cast<float>(s) / steps;
+        float xp = px + dx * t, yp = py + dy * t;
+        float ox = xp - kCenterX, oy = yp - kCenterY;
+        if (ox * ox + oy * oy <= r2) {
+          gfx->fillCircle(static_cast<int16_t>(xp), static_cast<int16_t>(yp), 1,
+                          c);
+        }
+      }
+    }
+    px = x;
+    py = y;
+    have = true;
+  }
+}
+
 void renderStatic(Model& model) {
   g_static->fillScreen(C_BG);
   if (model.ui.online && showWeather(model)) drawWeather(g_static, model);
@@ -925,6 +961,7 @@ void renderStatic(Model& model) {
   // Airports ride the flights layer (they hide in weather-only mode,
   // like the traffic and POIs), independent of the Geography toggle.
   if (showFlights(model)) drawAirports(g_static, model);
+  if (model.ui.following) drawFollowTrail(g_static, model);
   drawHomeName(g_static, model);
   drawRangeReadout(g_static, model);
 }
@@ -1287,34 +1324,32 @@ void step(Model& model, uint32_t dtMs) {
     float kF = 1.0f - expf(-dt / kFollowTauMs);
     ac.est.x += (reckoned.x - ac.est.x) * kF;
     ac.est.y += (reckoned.y - ac.est.y) * kF;
+
+    // Sample the smoothed position into the bounded past-path trail.
+    if (now - model.ui.lastTrailMs >= kTrailSampleMs) {
+      model.ui.lastTrailMs = now;
+      model.ui.followTrail.push_back(ac.est);
+      if (static_cast<int>(model.ui.followTrail.size()) > kTrailMaxPoints) {
+        model.ui.followTrail.erase(model.ui.followTrail.begin());
+      }
+    }
   }
 
-  // Ease the view center toward its target. Not following, that is the
-  // home origin, chased continuously (with a snap once converged, so the
-  // static-scene signature settles). Following, the view stays pinned —
-  // a moving center re-anchors the geography, which costs a full static
-  // rebuild per shift — until the flight has drifted well off center;
-  // then one latched recentering pan chases it back in.
+  // Ease the view center toward its target: the home origin when not
+  // following (chased continuously, with a snap once converged so the
+  // static-scene signature settles), or the followed flight when following,
+  // tracked continuously so the map moves along with it and the flight stays
+  // near center. The center shifts about a pixel a second at typical ranges,
+  // so the static scene rebuilds on those pixel steps, not every frame.
   Vec target{0, 0};
-  bool ease = true;
-  if (haveFollow) {
-    target = model.aircraft[model.ui.followIndex].est;
-    float drift = distanceFrom(model, target);
-    if (drift > model.ui.range * 0.30f) g_recentering = true;
-    if (drift < model.ui.range * 0.03f) g_recentering = false;
-    ease = g_recentering;
-  } else {
-    g_recentering = false;
-  }
-  if (ease) {
-    float kEase = 1.0f - expf(-dt / kPanTauMs);
-    model.ui.viewCenter.x += (target.x - model.ui.viewCenter.x) * kEase;
-    model.ui.viewCenter.y += (target.y - model.ui.viewCenter.y) * kEase;
-    float ppn = pixelsPerNm(model);
-    if (fabsf(target.x - model.ui.viewCenter.x) * ppn < 0.5f &&
-        fabsf(target.y - model.ui.viewCenter.y) * ppn < 0.5f) {
-      model.ui.viewCenter = target;  // Sub-pixel: stop dithering the scene.
-    }
+  if (haveFollow) target = model.aircraft[model.ui.followIndex].est;
+  float kEase = 1.0f - expf(-dt / kPanTauMs);
+  model.ui.viewCenter.x += (target.x - model.ui.viewCenter.x) * kEase;
+  model.ui.viewCenter.y += (target.y - model.ui.viewCenter.y) * kEase;
+  float ppn = pixelsPerNm(model);
+  if (fabsf(target.x - model.ui.viewCenter.x) * ppn < 0.5f &&
+      fabsf(target.y - model.ui.viewCenter.y) * ppn < 0.5f) {
+    model.ui.viewCenter = target;  // Sub-pixel: stop dithering the scene.
   }
 
   // Advance the sweep and refresh whatever it crossed. Derive the angle from
