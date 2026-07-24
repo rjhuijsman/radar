@@ -28,18 +28,20 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
   <h2>Homes</h2><div id="homes"></div><button class="add" onclick="add('homes')">+ Home</button>
   <h2>Points of interest</h2><div id="pois"></div><button class="add" onclick="add('pois')">+ POI</button>
   <h2>Calendar feeds (iCal)</h2><div id="feeds"></div><button class="add" onclick="add('feeds')">+ Feed</button>
+  <h2>Wi-Fi networks</h2><div id="wifi"></div><button class="add" onclick="add('wifi')">+ Network</button>
   <button id="save" onclick="save()">Save &amp; apply</button>
 </main>
 <script>
-let data = { range: 40, homes: [], pois: [], feeds: [] };
+let data = { range: 40, homes: [], pois: [], feeds: [], wifi: [] };
 const F = {
   homes: [["name", "Name"], ["lat", "Lat"], ["lon", "Lon"]],
   pois: [["name", "Name"], ["lat", "Lat"], ["lon", "Lon"]],
   feeds: [["name", "Name"], ["url", "iCal URL"]],
+  wifi: [["ssid", "SSID"], ["password", "Password"]],
 };
 function render() {
   document.getElementById("range").value = data.range;
-  for (const key of ["homes", "pois", "feeds"]) {
+  for (const key of ["homes", "pois", "feeds", "wifi"]) {
     const host = document.getElementById(key);
     host.innerHTML = "";
     data[key].forEach((item, i) => {
@@ -49,6 +51,12 @@ function render() {
         const input = document.createElement("input");
         input.placeholder = ph;
         input.value = item[f] ?? "";
+        // Saved Wi-Fi passwords never come back from the API; leaving
+        // the field blank on save keeps the one stored on the device.
+        if (f === "password") {
+          input.type = "password";
+          if (item.hasPassword) input.placeholder = "(saved - blank keeps it)";
+        }
         input.oninput = () => { item[f] = input.value; };
         row.appendChild(input);
       });
@@ -63,6 +71,7 @@ function render() {
 function add(key) { data[key].push({ enabled: true }); render(); }
 async function load() {
   data = await (await fetch("/api/state")).json();
+  for (const key of ["homes", "pois", "feeds", "wifi"]) data[key] ??= [];
   render();
 }
 async function save() {

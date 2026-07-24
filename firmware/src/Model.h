@@ -65,6 +65,14 @@ struct Feed {
   bool enabled = true;
 };
 
+// A remembered Wi-Fi network. The set keeps several and joins whichever
+// is in range (see net::begin). Persisted in the config file; the web
+// API accepts the password on writes but never reads it back out.
+struct WifiNetwork {
+  String ssid;
+  String password;  // Empty for an open network.
+};
+
 // The rain-radar layer published by feeds::pollWeather: RainViewer
 // reflectivity decoded into a Web-Mercator pixel mosaic the renderer
 // samples at static-rebuild time. The mosaic is georeferenced absolutely
@@ -120,6 +128,7 @@ struct Model {
   std::vector<Poi> pois;
   std::vector<Home> homes;
   std::vector<Feed> feeds;
+  std::vector<WifiNetwork> wifi;
   WeatherLayer weather;
 
   // Traffic poll request, consumed (cleared) by the network task. Set by

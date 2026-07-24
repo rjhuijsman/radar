@@ -81,6 +81,27 @@ constexpr char AP_NAME[] = "Radar-Setup";
 // mDNS host: reachable as `<MDNS_HOST>.local` once on the network.
 constexpr char MDNS_HOST[] = "radar-720";
 
+// ---- Wi-Fi memory. ----
+// The set remembers up to this many networks (home Wi-Fi, phone
+// hotspot, ...) in its config file and joins whichever known one is in
+// range, strongest first. See net::begin() / net::loopWifi().
+constexpr size_t WIFI_MAX_NETWORKS = 8;
+// Association timeout for the single join attempt inside one
+// WiFiMulti scan-and-join round.
+constexpr uint32_t WIFI_JOIN_TIMEOUT_MS = 8000;
+// How long boot keeps rescanning for a saved network before falling
+// back to the captive portal.
+constexpr uint32_t WIFI_BOOT_SCAN_MS = 25000;
+// While offline after boot, rescan for saved networks this often; this
+// is what roams the set to a different known network (hotspot up, home
+// AP gone). The first rescan also waits this long, giving the core's
+// own auto-reconnect first shot at a transient drop.
+constexpr uint32_t WIFI_RETRY_MS = 15000;
+// The fallback portal gives up after this long when saved networks
+// exist (so the background rescans resume); with none saved it is the
+// only way online and reopens until provisioned.
+constexpr uint32_t WIFI_PORTAL_TIMEOUT_S = 300;
+
 // ArduinoOTA authenticates each push against this MD5 hash, so the
 // password never lives in the firmware in plaintext. Replace it with the
 // hash of your own password before flashing:

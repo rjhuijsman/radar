@@ -98,7 +98,8 @@ void networkTask(void*) {
   bool wasOnline = ok;
   uint32_t lastAdsb = 0, lastIcal = 0, lastWeather = 0;
   for (;;) {
-    net::loopOta();  // Pick up any pending Wi-Fi update promptly.
+    net::loopOta();   // Pick up any pending Wi-Fi update promptly.
+    net::loopWifi();  // While offline, rescan for any saved network.
 
     // Reflect Wi-Fi drops/reconnects to the renderer (lock only on change).
     bool nowOnline = net::online();
