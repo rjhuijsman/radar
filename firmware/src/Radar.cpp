@@ -1335,21 +1335,28 @@ void step(Model& model, uint32_t dtMs) {
     }
   }
 
-  // Ease the view center toward its target: the home origin when not
-  // following (chased continuously, with a snap once converged so the
-  // static-scene signature settles), or the followed flight when following,
-  // tracked continuously so the map moves along with it and the flight stays
-  // near center. The center shifts about a pixel a second at typical ranges,
-  // so the static scene rebuilds on those pixel steps, not every frame.
+  // Ease the view center toward its target: the home origin when idle
+  // (chased continuously, snapping once converged so the static-scene
+  // signature settles), or the followed flight when following (tracked
+  // continuously so the map moves along with it). A follow paused by weather
+  // mode instead FREEZES the view where it is — the map holds the flight's
+  // last spot until tracking resumes or a deliberate go-home releases it.
   Vec target{0, 0};
-  if (haveFollow) target = model.aircraft[model.ui.followIndex].est;
-  float kEase = 1.0f - expf(-dt / kPanTauMs);
-  model.ui.viewCenter.x += (target.x - model.ui.viewCenter.x) * kEase;
-  model.ui.viewCenter.y += (target.y - model.ui.viewCenter.y) * kEase;
-  float ppn = pixelsPerNm(model);
-  if (fabsf(target.x - model.ui.viewCenter.x) * ppn < 0.5f &&
-      fabsf(target.y - model.ui.viewCenter.y) * ppn < 0.5f) {
-    model.ui.viewCenter = target;  // Sub-pixel: stop dithering the scene.
+  bool freeze = false;
+  if (haveFollow) {
+    target = model.aircraft[model.ui.followIndex].est;
+  } else if (model.ui.pausedFollow.length() > 0) {
+    freeze = true;
+  }
+  if (!freeze) {
+    float kEase = 1.0f - expf(-dt / kPanTauMs);
+    model.ui.viewCenter.x += (target.x - model.ui.viewCenter.x) * kEase;
+    model.ui.viewCenter.y += (target.y - model.ui.viewCenter.y) * kEase;
+    float ppn = pixelsPerNm(model);
+    if (fabsf(target.x - model.ui.viewCenter.x) * ppn < 0.5f &&
+        fabsf(target.y - model.ui.viewCenter.y) * ppn < 0.5f) {
+      model.ui.viewCenter = target;  // Sub-pixel: stop dithering the scene.
+    }
   }
 
   // Advance the sweep and refresh whatever it crossed. Derive the angle from
