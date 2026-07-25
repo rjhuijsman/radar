@@ -1025,21 +1025,33 @@ void drawFollowTrail(Arduino_GFX* gfx, const Model& model) {
                      static_cast<int>(model.aircraft.size()) &&
                  model.aircraft[model.ui.followIndex].special;
   uint16_t c = dim(special ? C_AMBER : C_GREEN, model.ui.brightness * 0.7f);
+  // Dots land every ~7 px of CUMULATIVE path length, carried across the
+  // points. The live tail samples sit only a pixel or two apart at
+  // typical range and speed, so per-segment spacing (each segment's dot
+  // count rounded down independently) would draw nothing at all for it —
+  // the trail vector grew while the drawn path never did.
+  constexpr float kDotSpacingPx = 7.0f;
   float px = 0, py = 0;
+  float toNext = 0;  // Path distance left until the next dot.
   bool have = false;
   for (size_t i = 0; i < trail.size(); ++i) {
     float x, y;
     project(model, trail[i], x, y);
-    if (have) {  // A 3 px dot every ~7 px along the segment, across the panel.
+    if (have) {
       float dx = x - px, dy = y - py;
-      int steps = static_cast<int>(sqrtf(dx * dx + dy * dy) / 7.0f);
-      for (int s = 1; s <= steps; ++s) {
-        float t = static_cast<float>(s) / steps;
-        float xp = px + dx * t, yp = py + dy * t;
-        if (xp >= 0 && xp < g_w && yp >= 0 && yp < g_h) {
-          gfx->fillCircle(static_cast<int16_t>(xp), static_cast<int16_t>(yp), 1,
-                          c);
+      float dist = sqrtf(dx * dx + dy * dy);
+      if (dist > 0.0f) {
+        float along = toNext;
+        while (along <= dist) {
+          float t = along / dist;
+          float xp = px + dx * t, yp = py + dy * t;
+          if (xp >= 0 && xp < g_w && yp >= 0 && yp < g_h) {
+            gfx->fillCircle(static_cast<int16_t>(xp),
+                            static_cast<int16_t>(yp), 1, c);
+          }
+          along += kDotSpacingPx;
         }
+        toNext = along - dist;
       }
     }
     px = x;

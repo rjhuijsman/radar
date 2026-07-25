@@ -626,12 +626,9 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
 // the current UTC day. When a flight is followed, pollTrace fetches that
 // file once, decimates it, and seeds model.ui.followTrail with it, so
 // the dotted trail reaches back along the flight's real path instead of
-// starting where the follow began. The renderer keeps appending its live
-// samples behind the seed — but its bounded-trail cap also drops the
-// OLDEST point for every sample once the trail is long, which would eat
-// the seeded history within minutes. A cheap periodic mend therefore
-// folds the fresh live samples into a canonical history + live tail kept
-// here and republishes it, restoring the historic prefix.
+// starting where the follow began. From there the renderer owns the
+// trail: it appends its live samples behind the seed, and its cap holds
+// the seeded prefix plus a long live tail.
 
 // Trace tuning. The file arrives gzip-compressed no matter what the
 // request advertises (~7 KB wire, ~40 KB inflated for a typical day), so
@@ -756,18 +753,120 @@ uint8_t* traceReadBody(HTTPClient& http, size_t& len) {
   return buf;
 }
 
+// Skips ASCII whitespace. The scanner below never leaves the buffer.
+const char* skipWs(const char* p, const char* end) {
+  while (p < end &&
+         (*p == ' ' || *p == '\n' || *p == '\r' || *p == '\t')) {
+    ++p;
+  }
+  return p;
+}
+
+// Scans the trace JSON for the "trace" array and hands every plottable
+// point's latitude and longitude (fields [1] and [2] of each entry;
+// either may be null) to `fn(lat, lon)`, oldest first. A hand scanner
+// instead of a real parse: a long-haul day runs to thousands of points,
+// and holding them as an ArduinoJson document costs megabytes of PSRAM
+// the set does not have (observed on-device: NoMemory at ~870 KB of
+// trace JSON with 3.2 MB free — the reason a followed flight almost
+// never showed its history). The scan holds nothing but its cursor;
+// each point's remaining fields — nested objects, strings, escapes
+// included — are skipped by depth.
+template <typename PointFn>
+void scanTracePoints(const char* json, size_t len, PointFn&& fn) {
+  const char* end = json + len;
+
+  // Locate the array: the quoted "trace" key, then ':', then '['. A
+  // string VALUE containing the needle fails those two checks and the
+  // search moves on.
+  const char* p = nullptr;
+  for (const char* s = json; s + 7 <= end - 1; ++s) {
+    if (memcmp(s, "\"trace\"", 7) != 0) continue;
+    const char* q = skipWs(s + 7, end);
+    if (q < end && *q == ':') {
+      q = skipWs(q + 1, end);
+      if (q < end && *q == '[') {
+        p = q + 1;
+        break;
+      }
+    }
+  }
+  if (p == nullptr) return;
+
+  while (p < end) {
+    p = skipWs(p, end);
+    if (p >= end || *p == ']') return;  // End of the trace array.
+    if (*p == ',') {
+      ++p;
+      continue;
+    }
+    if (*p != '[') return;  // Not a point array: malformed, stop.
+    ++p;
+
+    // The first three fields of a point are scalars — timestamp, lat,
+    // lon (a missing fix leaves the coordinates null). Each token is
+    // copied out and parsed bounded, so a number at the very end of
+    // the buffer can never run the parse past it.
+    float vals[3] = {0, 0, 0};
+    bool numeric[3] = {false, false, false};
+    int fields = 0;
+    for (int f = 0; f < 3; ++f) {
+      p = skipWs(p, end);
+      const char* tok = p;
+      while (p < end && *p != ',' && *p != ']') ++p;
+      char buf[24];
+      size_t n = min(static_cast<size_t>(p - tok), sizeof(buf) - 1);
+      memcpy(buf, tok, n);
+      buf[n] = 0;
+      char* after = nullptr;
+      vals[f] = strtof(buf, &after);
+      numeric[f] = after != buf;
+      ++fields;
+      if (p >= end || *p == ']') break;  // Short point.
+      ++p;                               // Past the ','.
+    }
+
+    // Skip the remainder of the point (any nesting, strings with
+    // escapes); the walk starts inside the point's '[', so a short
+    // point's ']' closes it immediately.
+    int depth = 1;
+    bool inStr = false;
+    while (p < end && depth > 0) {
+      char ch = *p++;
+      if (inStr) {
+        if (ch == '\\' && p < end) {
+          ++p;
+        } else if (ch == '"') {
+          inStr = false;
+        }
+      } else if (ch == '"') {
+        inStr = true;
+      } else if (ch == '[' || ch == '{') {
+        ++depth;
+      } else if (ch == ']' || ch == '}') {
+        --depth;
+      }
+    }
+
+    if (fields < 3 || !numeric[1] || !numeric[2]) continue;
+    float lat = vals[1], lon = vals[2];
+    if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) continue;
+    fn(lat, lon);
+  }
+}
+
 // Fetches `hex`'s full-day trace from adsb.lol and decimates it into at
 // most kTraceSeedPoints world positions, oldest first, with NO lock
 // held. The globe front end 302-redirects to the bare host; the body is
 // gzip regardless of what the request accepts, so it is read whole into
-// PSRAM, inflated there, and only then parsed (filtered, PSRAM-backed,
-// like the traffic path). Returns false on any fetch, size or parse
-// problem — the caller then leaves the live-only trail alone.
+// PSRAM, inflated there, and then scanned in place (see
+// scanTracePoints). Returns false on any fetch, size or scan problem —
+// the caller then leaves the live-only trail alone.
 bool fetchTrace(const model::Home& home, const String& hex,
                 std::vector<model::Vec>& out) {
   if (!WiFi.isConnected()) return false;
-  // Same guard as the traffic path: the TLS session and parser scratch
-  // live on the internal heap, the trace buffers in PSRAM.
+  // Same guard as the traffic path: the TLS session lives on the
+  // internal heap, the wire and inflated trace buffers in PSRAM.
   if (ESP.getFreeHeap() < 40 * 1024 ||
       heap_caps_get_free_size(MALLOC_CAP_SPIRAM) <
           kTraceMaxWireBytes + 512 * 1024) {
@@ -815,55 +914,28 @@ bool fetchTrace(const model::Home& home, const String& hex,
   }
 
   // Inflate — unless the server ever starts honoring identity encoding,
-  // in which case the body already opens as JSON and parses as-is.
+  // in which case the body already opens as JSON and scans as-is. The
+  // wire copy is dropped as soon as it is decoded, ahead of the scan.
   uint8_t* json = raw;
   size_t jsonLen = wire;
   if (raw[0] == 0x1f && wire >= 2 && raw[1] == 0x8b) {
     json = gunzip(raw, wire, jsonLen);
+    heap_caps_free(raw);
     if (json == nullptr) {
-      heap_caps_free(raw);
       Serial.println("[feeds] trace: gunzip failed.");
       return false;
     }
   }
 
-  // Keep only the trace array; the registration/airframe metadata (and
-  // the per-point detail objects' keys the filter can't reach) stay as
-  // small as the parse allows, all of it in PSRAM.
-  JsonDocument filter;
-  filter["trace"] = true;
-  static SpiRamAllocator allocator;
-  JsonDocument doc(&allocator);
-  DeserializationError err =
-      deserializeJson(doc, reinterpret_cast<const char*>(json), jsonLen,
-                      DeserializationOption::Filter(filter));
-  if (json != raw) heap_caps_free(json);
-  heap_caps_free(raw);
-  if (err) {
-    Serial.printf("[feeds] trace: parse failed (%s).\n", err.c_str());
-    return false;
-  }
-  JsonArrayConst trace = doc["trace"].as<JsonArrayConst>();
-  if (trace.isNull()) {
-    Serial.println("[feeds] trace: no 'trace' array.");
-    return false;
-  }
-
-  // Two passes, so the full-day path never lands anywhere whole: count
-  // the plottable points ([1] = lat, [2] = lon; either may be null),
-  // then keep an even spread of at most kTraceSeedPoints of them, oldest
-  // first, the newest always included so the history meets the live
-  // position.
+  // Two passes over the text, so the full-day path never lands anywhere
+  // whole: count the plottable points, then keep an even spread of at
+  // most kTraceSeedPoints of them, oldest first, the newest always
+  // included so the history meets the live position.
+  const char* text = reinterpret_cast<const char*>(json);
   size_t valid = 0;
-  for (JsonVariantConst v : trace) {
-    JsonArrayConst pt = v.as<JsonArrayConst>();
-    if (pt.isNull() || pt.size() < 3) continue;
-    if (!pt[1].is<float>() || !pt[2].is<float>()) continue;
-    float lat = pt[1], lon = pt[2];
-    if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) continue;
-    ++valid;
-  }
+  scanTracePoints(text, jsonLen, [&](float, float) { ++valid; });
   if (valid == 0) {
+    heap_caps_free(json);
     Serial.printf("[feeds] trace: no plottable points for %s.\n", hex.c_str());
     return false;
   }
@@ -871,17 +943,13 @@ bool fetchTrace(const model::Home& home, const String& hex,
   out.clear();
   out.reserve(kept);
   size_t index = 0, emitted = 0;
-  for (JsonVariantConst v : trace) {
-    JsonArrayConst pt = v.as<JsonArrayConst>();
-    if (pt.isNull() || pt.size() < 3) continue;
-    if (!pt[1].is<float>() || !pt[2].is<float>()) continue;
-    float lat = pt[1], lon = pt[2];
-    if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) continue;
+  scanTracePoints(text, jsonLen, [&](float lat, float lon) {
     size_t want = kept == 1 ? valid - 1 : emitted * (valid - 1) / (kept - 1);
-    if (index++ != want) continue;
+    if (index++ != want) return;
     out.push_back(geoToWorld(home, lat, lon));
     ++emitted;
-  }
+  });
+  heap_caps_free(json);
 
   Serial.printf(
       "[feeds] trace: %s %u B wire -> %u B json, %u pts -> %u kept "
