@@ -91,8 +91,11 @@ void jsonToConfig(const JsonDocument& doc, model::Model& model) {
   for (JsonObjectConst object : doc["homes"].as<JsonArrayConst>()) {
     model::Home home;
     home.name = object["name"] | "Home";
-    home.latitude = object["lat"] | 0.0f;
-    home.longitude = object["lon"] | 0.0f;
+    // as<float>() rather than `| 0.0f`: the dashboard's text inputs post
+    // coordinates as JSON strings, which `|` rejects as the wrong type
+    // (silently zeroing every location). as<float>() parses either form.
+    home.latitude = object["lat"].as<float>();
+    home.longitude = object["lon"].as<float>();
     model.homes.push_back(home);
   }
   if (model.ui.homeIndex >= static_cast<int>(model.homes.size())) {
@@ -103,8 +106,8 @@ void jsonToConfig(const JsonDocument& doc, model::Model& model) {
   for (JsonObjectConst object : doc["pois"].as<JsonArrayConst>()) {
     model::Poi poi;
     poi.name = object["name"] | "POI";
-    poi.latitude = object["lat"] | 0.0f;
-    poi.longitude = object["lon"] | 0.0f;
+    poi.latitude = object["lat"].as<float>();  // See the homes note above.
+    poi.longitude = object["lon"].as<float>();
     poi.isAirport = object["airport"] | false;
     for (JsonVariantConst heading : object["runways"].as<JsonArrayConst>()) {
       poi.runwayHeadings.push_back(heading.as<float>());
@@ -160,6 +163,39 @@ void jsonToConfig(const JsonDocument& doc, model::Model& model) {
   feeds::reprojectStatics(model);
 }
 
+// Adds the live status the dashboard shows alongside the config: a
+// per-special "found right now" flag, the read-only from-calendar
+// flights, and each feed's last sync result. Layered onto the /api/state
+// response only, so the config persisted to flash never carries it.
+// Callers hold the model mutex.
+void liveStatusToJson(const model::Model& model, JsonDocument& doc) {
+  JsonArray specials = doc["specials"].as<JsonArray>();
+  for (size_t i = 0; i < model.specials.size() && i < specials.size(); ++i) {
+    specials[i]["found"] =
+        feeds::flightTracked(model, model.specials[i].flight);
+  }
+  JsonArray ical = doc["icalSpecials"].to<JsonArray>();
+  for (const auto& special : model.icalSpecials) {
+    JsonObject object = ical.add<JsonObject>();
+    object["flight"] = special.flight;
+    object["date"] = special.date;
+    object["source"] = special.source;
+    object["found"] = feeds::flightTracked(model, special.flight);
+  }
+  JsonArray feedList = doc["feeds"].as<JsonArray>();
+  for (size_t i = 0; i < model.feeds.size() && i < feedList.size(); ++i) {
+    for (const auto& status : model.feedStatus) {
+      if (status.url != model.feeds[i].url) continue;
+      feedList[i]["syncOk"] = status.ok;
+      feedList[i]["syncAgeS"] = (millis() - status.syncMs) / 1000;
+      feedList[i]["syncTime"] = static_cast<uint32_t>(status.syncWall);
+      feedList[i]["syncFlights"] = status.flights;
+      break;
+    }
+  }
+  doc["icalPollMs"] = config::ICAL_POLL_MS;
+}
+
 void saveConfig(const model::Model& model) {
   JsonDocument doc;
   configToJson(model, doc, /*includeSecrets=*/true);
@@ -193,6 +229,9 @@ void handleConfigBody(AsyncWebServerRequest* request, uint8_t* data,
   lock();
   jsonToConfig(doc, *g_model);
   saveConfig(*g_model);
+  // Re-poll the calendars right away, so a just-added feed or manual
+  // special is matched now rather than after the hourly interval.
+  g_model->icalPollDue = true;
   unlock();
   request->send(200, "text/plain", "ok");
 }
@@ -211,6 +250,7 @@ void routes() {
     JsonDocument doc;
     lock();
     configToJson(*g_model, doc, /*includeSecrets=*/false);
+    liveStatusToJson(*g_model, doc);
     unlock();
     String out;
     serializeJson(doc, out);

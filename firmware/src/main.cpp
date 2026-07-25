@@ -111,7 +111,16 @@ void networkTask(void*) {
     }
 
     uint32_t now = millis();
-    if (now - lastIcal >= config::ICAL_POLL_MS || lastIcal == 0) {
+    // iCal polls hourly, plus on request — a config save raises
+    // icalPollDue so a just-added feed or manual special matches now.
+    bool icalDue = false;
+    xSemaphoreTake(g_mutex, portMAX_DELAY);
+    if (g_model.icalPollDue) {
+      g_model.icalPollDue = false;
+      icalDue = true;
+    }
+    xSemaphoreGive(g_mutex);
+    if (icalDue || now - lastIcal >= config::ICAL_POLL_MS || lastIcal == 0) {
       lastIcal = now;
       feeds::pollIcal(g_model, g_mutex);
     }

@@ -119,17 +119,35 @@ struct Parsed {
   bool special = false;
 };
 
-// Maps a 2-letter IATA airline code to its 3-letter ICAO prefix. Only a few
-// common carriers for now. TODO(feeds): load the full table from LittleFS.
+// Maps a 2-character IATA airline designator to its 3-letter ICAO prefix
+// (the one ADS-B callsigns start with). A generous slice of the carriers
+// likely to appear in a trip calendar; anything missing still matches when
+// the ICAO callsign is entered directly. TODO(feeds): load the full table
+// from LittleFS.
 String iataToIcao(const String& iata) {
   struct Entry {
     const char* iata;
     const char* icao;
   };
   static const Entry table[] = {
-      {"BA", "BAW"}, {"LH", "DLH"}, {"AF", "AFR"}, {"KL", "KLM"},
-      {"U2", "EZY"}, {"FR", "RYR"}, {"UA", "UAL"}, {"AA", "AAL"},
-      {"DL", "DAL"}, {"EK", "UAE"}, {"IB", "IBE"}, {"VS", "VIR"},
+      {"AA", "AAL"}, {"AC", "ACA"}, {"AF", "AFR"}, {"AI", "AIC"},
+      {"AS", "ASA"}, {"AY", "FIN"}, {"AZ", "ITY"}, {"A3", "AEE"},
+      {"BA", "BAW"}, {"BR", "EVA"}, {"BT", "BTI"}, {"BY", "TOM"},
+      {"B6", "JBU"}, {"CA", "CCA"}, {"CI", "CAL"}, {"CX", "CPA"},
+      {"CZ", "CSN"}, {"DL", "DAL"}, {"EI", "EIN"}, {"EK", "UAE"},
+      {"ET", "ETH"}, {"EW", "EWG"}, {"EY", "ETD"}, {"FI", "ICE"},
+      {"FR", "RYR"}, {"F9", "FFT"}, {"GA", "GIA"}, {"HA", "HAL"},
+      {"HV", "TRA"}, {"IB", "IBE"}, {"JL", "JAL"}, {"JQ", "JST"},
+      {"KE", "KAL"}, {"KL", "KLM"}, {"LH", "DLH"}, {"LO", "LOT"},
+      {"LS", "EXS"}, {"LX", "SWR"}, {"LY", "ELY"}, {"MH", "MAS"},
+      {"MS", "MSR"}, {"MU", "CES"}, {"NH", "ANA"}, {"NK", "NKS"},
+      {"NZ", "ANZ"}, {"OR", "TFL"}, {"OS", "AUA"}, {"OZ", "AAR"},
+      {"PC", "PGT"}, {"QF", "QFA"}, {"QR", "QTR"}, {"SK", "SAS"},
+      {"SN", "BEL"}, {"SQ", "SIA"}, {"SU", "AFL"}, {"SV", "SVA"},
+      {"TG", "THA"}, {"TK", "THY"}, {"TO", "TVF"}, {"TP", "TAP"},
+      {"UA", "UAL"}, {"UX", "AEA"}, {"U2", "EZY"}, {"VA", "VOZ"},
+      {"VS", "VIR"}, {"VY", "VLG"}, {"WN", "SWA"}, {"WS", "WJA"},
+      {"W6", "WZZ"}, {"6E", "IGO"},
   };
   for (auto& entry : table) {
     if (iata == entry.iata) return entry.icao;
@@ -1006,92 +1024,174 @@ String eventDate(const String& event) {
   return date.length() == 8 ? date : "";
 }
 
-// Scans free text for airline-code + number designators (e.g. "BA 117") and
-// inserts the ICAO callsign the ADS-B feed broadcasts (e.g. "BAW117").
-void scanFlights(const String& text, std::set<String>& out) {
+// Scans free text for airline-code + number designators (e.g. "BA 117")
+// and inserts the ICAO callsign the ADS-B feed broadcasts (e.g. "BAW117")
+// into `out`. Each designator newly added is also recorded in `found` as
+// it appeared ("BA117"), for the dashboard's from-calendar list. The code
+// is a letter plus a letter or digit (U2, W6) at a word boundary, so
+// prose running into a designator cannot fake one.
+void scanFlights(const String& text, std::set<String>& out,
+                 std::vector<String>* found) {
   int n = static_cast<int>(text.length());
   for (int i = 0; i + 2 < n; ++i) {
+    // Word boundary (unsigned: iCal text is UTF-8, and a negative char
+    // would index the ctype table out of bounds).
+    if (i > 0 && isalnum(static_cast<unsigned char>(text[i - 1]))) continue;
     char a = text[i], b = text[i + 1];
-    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z') continue;
+    if (a < 'A' || a > 'Z') continue;
+    if (!(b >= 'A' && b <= 'Z') && !(b >= '0' && b <= '9')) continue;
     int j = i + 2;
     while (j < n && text[j] == ' ') ++j;
     if (j >= n || !isdigit(text[j])) continue;
     String number;
     while (j < n && isdigit(text[j])) number += text[j++];
-    if (number.length() < 2 || number.length() > 4) continue;
+    if (number.length() < 1 || number.length() > 4) continue;
     String icao = iataToIcao(String(a) + String(b));
-    if (!icao.isEmpty()) out.insert(icao + number);
+    if (icao.isEmpty()) continue;
+    if (out.insert(icao + number).second && found != nullptr) {
+      found->push_back(String(a) + String(b) + number);
+    }
   }
 }
 
-// Adds the callsign forms a manually-entered flight number could broadcast
-// as: the ICAO airline prefix + number, and the raw entry, so an ICAO
-// callsign typed directly (e.g. "BAW117") also matches.
-void addManualFlight(const String& flight, std::set<String>& out) {
-  String code, number;
+// Adds the callsign forms a flight-number entry could broadcast as: the
+// entry itself normalized (uppercased, separators stripped), so a
+// directly-typed ICAO callsign like "QTR15K" or "BAW117" matches as-is,
+// plus the IATA->ICAO conversion of a two-character airline designator
+// ("QR106" -> "QTR106", keeping any suffix letter). Shared by the
+// specials matching and the dashboard's live "found" badges.
+void candidateCallsigns(const String& flight, std::set<String>& out) {
+  String raw;
   for (int i = 0; i < static_cast<int>(flight.length()); ++i) {
-    char c = toupper(flight[i]);
-    if (isalpha(c) && number.isEmpty()) {
-      code += c;
-    } else if (isdigit(c)) {
-      number += c;
-    }
+    unsigned char c = static_cast<unsigned char>(flight[i]);
+    if (isalnum(c)) raw += static_cast<char>(toupper(c));
   }
-  if (number.length() < 2 || number.length() > 4) return;
-  if (code.length() == 2) {
-    String icao = iataToIcao(code);
-    if (!icao.isEmpty()) out.insert(icao + number);
+  if (raw.length() < 3) return;  // Too short for any airline + number.
+  out.insert(raw);
+  // The IATA form: a two-character designator, then a 1-4 digit number,
+  // then at most one suffix letter (anything longer is already ICAO or
+  // not a designator at all, and the raw insert above has it covered).
+  String rest = raw.substring(2);
+  int digits = 0;
+  while (digits < static_cast<int>(rest.length()) && isdigit(rest[digits])) {
+    ++digits;
   }
-  if (code.length() >= 2) out.insert(code + number);  // Raw / already-ICAO.
+  if (digits < 1 || digits > 4) return;
+  if (static_cast<int>(rest.length()) - digits > 1) return;
+  String icao = iataToIcao(raw.substring(0, 2));
+  if (!icao.isEmpty()) out.insert(icao + rest);
+}
+
+bool flightTracked(const model::Model& model, const String& flight) {
+  std::set<String> forms;
+  candidateCallsigns(flight, forms);
+  for (const auto& ac : model.aircraft) {
+    if (forms.count(ac.callsign) > 0) return true;
+  }
+  return false;
 }
 
 int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
-  // Copy the enabled feed URLs and the manual specials out under the mutex;
+  // Copy the enabled feeds and the manual specials out under the mutex;
   // the fetches below run with no lock held.
-  std::vector<String> urls;
+  struct FeedRef {
+    String name;
+    String url;
+  };
+  std::vector<FeedRef> enabled;
   std::vector<model::SpecialFlight> manual;
   xSemaphoreTake(mutex, portMAX_DELAY);
   for (const auto& feed : model.feeds) {
-    if (feed.enabled) urls.push_back(feed.url);
+    if (feed.enabled) enabled.push_back(FeedRef{feed.name, feed.url});
   }
   manual = model.specials;
   xSemaphoreGive(mutex);
 
   // Both manual and iCal specials highlight only on their own date, so
-  // without the clock (NTP not yet synced) nothing is flagged.
+  // without the clock (NTP not yet synced) nothing is flagged. The boot
+  // poll can outrun the first SNTP sync — and the next interval is an
+  // hour out — so while online, wait briefly (no lock held) for the
+  // clock rather than run the whole day dateless.
   String today = todayUtc();
+  for (int waited = 0; today.isEmpty() && WiFi.isConnected() && waited < 10000;
+       waited += 100) {
+    vTaskDelay(pdMS_TO_TICKS(100));
+    today = todayUtc();
+  }
+  String todayIso;
+  if (!today.isEmpty()) {
+    todayIso = today.substring(0, 4) + "-" + today.substring(4, 6) + "-" +
+               today.substring(6);
+  }
 
   std::set<String> found;
 
   // Manually-entered specials due today.
   if (!today.isEmpty()) {
     for (const auto& s : manual) {
-      if (digitsOnly(s.date) == today) addManualFlight(s.flight, found);
+      if (digitsOnly(s.date) == today) candidateCallsigns(s.flight, found);
     }
   }
 
-  // iCal feeds: parse VEVENTs and keep only flights whose DTSTART is today.
+  // iCal feeds: parse VEVENTs and keep only flights whose DTSTART is
+  // today, recording per feed what matched and whether the fetch worked.
+  std::vector<model::IcalSpecial> fromCalendar;
+  std::vector<model::FeedStatus> statuses;
   int fetched = 0;
-  for (const auto& url : urls) {
+  for (const auto& feed : enabled) {
+    model::FeedStatus status;
+    status.url = feed.url;
+    status.syncMs = millis();
+    time_t wall = time(nullptr);
+    status.syncWall = wall < 1600000000L ? 0 : wall;  // 0 until NTP syncs.
     String body;
-    if (!httpGet(url, body)) continue;
-    ++fetched;
-    if (today.isEmpty()) continue;  // No clock: cannot date-filter safely.
-    body.replace("\r\n ", "");       // Unfold folded iCal content lines.
-    body.replace("\n ", "");
-    int idx = 0;
-    while (true) {
-      int evStart = body.indexOf("BEGIN:VEVENT", idx);
-      if (evStart < 0) break;
-      int evEnd = body.indexOf("END:VEVENT", evStart);
-      if (evEnd < 0) evEnd = static_cast<int>(body.length());
-      idx = evEnd + 1;
-      String event = body.substring(evStart, evEnd);
-      if (eventDate(event) == today) scanFlights(event, found);
+    status.ok = httpGet(feed.url, body);
+    if (status.ok) {
+      ++fetched;
+      if (!today.isEmpty()) {  // No clock: cannot date-filter safely.
+        body.replace("\r\n ", "");  // Unfold folded iCal content lines.
+        body.replace("\n ", "");
+        size_t before = fromCalendar.size();
+        int idx = 0;
+        while (true) {
+          int evStart = body.indexOf("BEGIN:VEVENT", idx);
+          if (evStart < 0) break;
+          int evEnd = body.indexOf("END:VEVENT", evStart);
+          if (evEnd < 0) evEnd = static_cast<int>(body.length());
+          idx = evEnd + 1;
+          String event = body.substring(evStart, evEnd);
+          if (eventDate(event) != today) continue;
+          std::vector<String> designators;
+          scanFlights(event, found, &designators);
+          for (const auto& designator : designators) {
+            model::IcalSpecial special;
+            special.flight = designator;
+            special.date = todayIso;
+            special.source = feed.name;
+            fromCalendar.push_back(special);
+          }
+        }
+        status.flights = static_cast<int>(fromCalendar.size() - before);
+      }
     }
+    statuses.push_back(status);
   }
 
+  // Publish. The callsign set only feeds the traffic tagging on this same
+  // task, so it needs no lock; the dashboard-facing lists go into the
+  // model under the mutex, briefly.
   g_specials = found;
+  Serial.printf(
+      "[feeds] ical: %d/%u feed(s) ok, %u calendar + %u manual entries -> "
+      "%u special callsign(s) for %s\n",
+      fetched, static_cast<unsigned>(enabled.size()),
+      static_cast<unsigned>(fromCalendar.size()),
+      static_cast<unsigned>(manual.size()), static_cast<unsigned>(found.size()),
+      today.isEmpty() ? "(no clock)" : today.c_str());
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  model.icalSpecials = std::move(fromCalendar);
+  model.feedStatus = std::move(statuses);
+  xSemaphoreGive(mutex);
   return fetched;
 }
 

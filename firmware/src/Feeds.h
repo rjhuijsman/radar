@@ -22,8 +22,19 @@ namespace feeds {
 bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex);
 
 // Fetches every enabled iCal feed and rebuilds the set of special ICAO
-// callsigns used by `pollTraffic`. Returns the number of feeds fetched.
+// callsigns used by `pollTraffic` from the feeds' today-dated flights plus
+// the manually-entered specials due today. Also publishes the dashboard's
+// live views: `model.icalSpecials` (the from-calendar flights matched
+// today) and `model.feedStatus` (per-feed sync result and time). Returns
+// the number of feeds fetched successfully.
 int pollIcal(model::Model& model, SemaphoreHandle_t mutex);
+
+// True when any ICAO callsign form of `flight` — the raw entry normalized,
+// or its IATA airline code converted ("QR106" -> "QTR106") — matches an
+// aircraft currently tracked. A live snapshot against the fetched traffic:
+// false may just mean the flight is outside the fetch radius right now.
+// Callers hold the model mutex.
+bool flightTracked(const model::Model& model, const String& flight);
 
 // Keeps the rain-radar layer current. When the refetch interval has
 // elapsed — or the view has left the fetched tiles and settled — fetches

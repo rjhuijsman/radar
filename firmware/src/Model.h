@@ -81,6 +81,26 @@ struct SpecialFlight {
   String date;    // YYYY-MM-DD; highlighted only on this date.
 };
 
+// A flight matched out of an iCal feed for today, retained for the web
+// dashboard's read-only from-calendar list. Rebuilt by feeds::pollIcal
+// each poll; never persisted (the feed itself is the source of truth).
+struct IcalSpecial {
+  String flight;  // Designator as found in the event text, e.g. "QR106".
+  String date;    // YYYY-MM-DD (UTC) it matched on — always today.
+  String source;  // Name of the feed it came from.
+};
+
+// Live sync state of one calendar feed, keyed by URL so a config save
+// (which rebuilds `feeds`) cannot wipe it. Rebuilt by feeds::pollIcal;
+// never persisted.
+struct FeedStatus {
+  String url;
+  bool ok = false;      // The last fetch attempt succeeded.
+  uint32_t syncMs = 0;  // millis() of the last fetch attempt.
+  time_t syncWall = 0;  // Wall clock of that attempt; 0 before NTP sync.
+  int flights = 0;      // Flights matched for today in the last parse.
+};
+
 // A remembered Wi-Fi network. The set keeps several and joins whichever
 // is in range (see net::begin). Persisted in the config file; the web
 // API accepts the password on writes but never reads it back out.
@@ -153,6 +173,8 @@ struct Model {
   std::vector<Home> homes;
   std::vector<Feed> feeds;
   std::vector<SpecialFlight> specials;  // Manually-entered special flights.
+  std::vector<IcalSpecial> icalSpecials;  // Today's from-calendar flights.
+  std::vector<FeedStatus> feedStatus;     // Per-feed sync state (by URL).
   std::vector<WifiNetwork> wifi;
   WeatherLayer weather;
 
@@ -162,6 +184,11 @@ struct Model {
   // repopulates promptly around the new home. Starts true for an
   // immediate first poll on boot.
   bool adsbPollDue = true;
+
+  // iCal poll request, consumed (cleared) by the network task. Set on
+  // every config save, so a just-added feed or manual special is matched
+  // right away instead of waiting out the hourly interval.
+  bool icalPollDue = false;
 };
 
 }  // namespace model
