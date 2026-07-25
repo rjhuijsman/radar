@@ -34,7 +34,7 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <main>
   <h1>🛩 Radar 720</h1>
   <h2>Default range (NM)</h2>
-  <div class="note">Zoom used at startup and when the knob cycles between homes.</div>
+  <div class="note">Default zoom at startup and on home-to-home switches, unless a home sets its own Zoom (below).</div>
   <div class="row"><input id="range" type="number" min="5" max="240"></div>
   <h2>Homes</h2><div id="homes"></div><button class="add" onclick="add('homes')">+ Home</button>
   <h2>Calendar feeds (iCal)</h2>
@@ -53,7 +53,7 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <script>
 let data = { range: 40, homes: [], pois: [], feeds: [], specials: [], icalSpecials: [], wifi: [] };
 const F = {
-  homes: [["name", "Name"], ["lat", "Lat"], ["lon", "Lon"]],
+  homes: [["name", "Name"], ["lat", "Lat"], ["lon", "Lon"], ["zoom", "Zoom"]],
   pois: [["name", "Name"], ["lat", "Lat"], ["lon", "Lon"]],
   feeds: [["name", "Name"], ["url", "iCal URL"]],
   specials: [["flight", "Flight (e.g. QR106)"], ["date", "dd-mm-yyyy"]],
@@ -137,7 +137,7 @@ function render() {
         }
         // Coordinates post as numbers whenever they parse; the firmware
         // accepts either, but numbers keep the config file tidy.
-        if (f === "lat" || f === "lon") {
+        if (f === "lat" || f === "lon" || f === "zoom") {
           input.oninput = () => {
             const n = Number(input.value);
             item[f] = input.value !== "" && Number.isFinite(n) ? n

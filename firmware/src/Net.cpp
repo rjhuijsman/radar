@@ -46,6 +46,7 @@ void configToJson(const model::Model& model, JsonDocument& doc,
     object["name"] = home.name;
     object["lat"] = home.latitude;
     object["lon"] = home.longitude;
+    if (home.defaultRange > 0) object["zoom"] = home.defaultRange;
   }
   JsonArray pois = doc["pois"].to<JsonArray>();
   for (const auto& poi : model.pois) {
@@ -98,6 +99,8 @@ void jsonToConfig(const JsonDocument& doc, model::Model& model) {
     // (silently zeroing every location). as<float>() parses either form.
     home.latitude = object["lat"].as<float>();
     home.longitude = object["lon"].as<float>();
+    home.defaultRange =
+        object["zoom"].isNull() ? 0.0f : object["zoom"].as<float>();
     model.homes.push_back(home);
   }
   if (model.ui.homeIndex >= static_cast<int>(model.homes.size())) {
@@ -214,7 +217,11 @@ void loadConfig(model::Model& model) {
   JsonDocument doc;
   if (!deserializeJson(doc, file)) jsonToConfig(doc, model);
   file.close();
-  model.ui.range = model.ui.defaultRange;  // Boot opens at the default zoom.
+  // Boot opens at the active home's zoom (its own, or the global default).
+  model.ui.range =
+      model.homes.empty() || model.homes[model.ui.homeIndex].defaultRange <= 0
+          ? model.ui.defaultRange
+          : model.homes[model.ui.homeIndex].defaultRange;
 }
 
 // Accumulates a POST body across chunks, then applies and persists it.

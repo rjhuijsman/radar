@@ -150,8 +150,10 @@ void press(Model& model) {
       model.ui.homeIndex = (model.ui.homeIndex + 1) %
                            static_cast<int>(model.homes.size());
       // Home-to-home switches (this branch only, never home<->flight) return
-      // to the configured default zoom.
-      model.ui.range = model.ui.defaultRange;
+      // to that home's default zoom (its own, or the global default).
+      const model::Home& newHome = model.homes[model.ui.homeIndex];
+      model.ui.range = newHome.defaultRange > 0 ? newHome.defaultRange
+                                                : model.ui.defaultRange;
       model.ui.lastZoomMs = millis();  // Emphasize the range readout briefly.
       // The world is measured from the active home: aircraft positions
       // from the old home are hundreds of NM off, so drop them and ask

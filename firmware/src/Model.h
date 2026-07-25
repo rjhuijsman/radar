@@ -63,6 +63,7 @@ struct Home {
   String name;
   float latitude = 0;
   float longitude = 0;
+  float defaultRange = 0;  // Per-home default zoom in NM; 0 = the global one.
 };
 
 // A calendar feed that contributes special flights.
