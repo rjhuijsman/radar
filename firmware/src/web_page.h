@@ -24,6 +24,7 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
   .badge { flex: none; font-size: 12px; white-space: nowrap; cursor: default; }
   .badge.on { color: #3dffa4; }
   .badge.off { color: #8ba396; }
+  .badge.warn { color: #e0836f; }
   .tag { flex: none; font-size: 11px; color: #8ba396; border: 1px solid #1b2c26; border-radius: 6px; padding: 2px 6px; white-space: nowrap; cursor: default; }
   .status { font-size: 12px; color: #8ba396; margin: -2px 0 8px 2px; }
   .status.ok { color: #3dffa4; }
@@ -93,6 +94,17 @@ function upcomingBadge() {
     "the day of the flight.";
   return b;
 }
+// A flight we detected but cannot match to a broadcast callsign (unknown
+// airline code): it will never highlight, so say so rather than a status.
+function notTrackableBadge() {
+  const b = document.createElement("span");
+  b.className = "badge warn";
+  b.textContent = "⚠ not trackable";
+  b.title = "The airline code isn't recognized, so this flight can't be " +
+    "matched to a live aircraft and won't highlight on the scope. Enter the " +
+    "ICAO callsign to track it.";
+  return b;
+}
 // One feed's sync line: result and age of the last fetch attempt.
 function feedStatus(item) {
   const st = document.createElement("div");
@@ -157,7 +169,8 @@ function render() {
         row.appendChild(input);
       });
       if (key === "specials" && "found" in item) {
-        row.appendChild(badge(item.found));
+        row.appendChild(item.trackable === false ? notTrackableBadge()
+                                                  : badge(item.found));
       }
       // Homes cycle on the device in list order, so let them be reordered.
       if (key === "homes") {
@@ -202,7 +215,8 @@ function render() {
     row.appendChild(tag);
     // Today's flights carry the live in-view badge; upcoming ones show
     // when they will flag, since they cannot be tracked before their day.
-    row.appendChild(item.today ? badge(item.found) : upcomingBadge());
+    row.appendChild(item.trackable === false ? notTrackableBadge()
+                    : item.today ? badge(item.found) : upcomingBadge());
     ihost.appendChild(row);
   });
 }

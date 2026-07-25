@@ -153,7 +153,7 @@ String iataToIcao(const String& iata) {
       {"TG", "THA"}, {"TK", "THY"}, {"TO", "TVF"}, {"TP", "TAP"},
       {"UA", "UAL"}, {"UX", "AEA"}, {"U2", "EZY"}, {"VA", "VOZ"},
       {"VS", "VIR"}, {"VY", "VLG"}, {"WN", "SWA"}, {"WS", "WJA"},
-      {"W6", "WZZ"}, {"6E", "IGO"},
+      {"W6", "WZZ"}, {"6E", "IGO"}, {"D8", "IBK"}, {"DY", "NAX"},
   };
   for (auto& entry : table) {
     if (iata == entry.iata) return entry.icao;
@@ -1254,10 +1254,14 @@ void scanFlights(const String& text, std::set<String>& out,
     String number;
     while (j < n && isdigit(text[j])) number += text[j++];
     if (number.length() < 1 || number.length() > 4) continue;
+    String designator = String(a) + String(b) + number;
     String icao = iataToIcao(String(a) + String(b));
-    if (icao.isEmpty()) continue;
-    if (out.insert(icao + number).second && found != nullptr) {
-      found->push_back(String(a) + String(b) + number);
+    if (!icao.isEmpty()) out.insert(icao + number);
+    // List every flight the feed names, even carriers not in the table --
+    // they surface as "not trackable" rather than silently vanishing.
+    if (found != nullptr &&
+        std::find(found->begin(), found->end(), designator) == found->end()) {
+      found->push_back(designator);
     }
   }
 }
@@ -1297,6 +1301,42 @@ bool flightTracked(const model::Model& model, const String& flight) {
     if (forms.count(ac.callsign) > 0) return true;
   }
   return false;
+}
+
+// Whether a flight can be matched to the ICAO callsign ADS-B broadcasts: a
+// 3-letter (ICAO) prefix already is one, and a 2-character IATA code only if
+// it is in the iataToIcao table. Drives the dashboard's "not trackable"
+// marker, so a detected-but-unmatchable flight says so rather than pretending
+// it will highlight.
+bool flightTrackable(const String& flight) {
+  String raw;
+  for (int i = 0; i < static_cast<int>(flight.length()); ++i) {
+    unsigned char c = static_cast<unsigned char>(flight[i]);
+    if (isalnum(c)) raw += static_cast<char>(toupper(c));
+  }
+  if (raw.length() < 3) return false;
+  int letters = 0;
+  while (letters < static_cast<int>(raw.length()) && isalpha(raw[letters])) {
+    ++letters;
+  }
+  if (letters >= 3) return true;  // Already an ICAO callsign form.
+  if (letters < 1) return false;
+  return !iataToIcao(raw.substring(0, 2)).isEmpty();
+}
+
+// The SUMMARY line's value from a (line-unfolded) VEVENT, or "". TripIt names
+// the flight there ("D83515 LGW to CPH"), so scanning just this keeps booking
+// references and other body text out of the flight list.
+String summaryOf(const String& event) {
+  int s = event.indexOf("SUMMARY");
+  if (s < 0) return "";
+  int colon = event.indexOf(':', s);
+  if (colon < 0) return "";
+  int nl = event.indexOf('\n', colon);
+  if (nl < 0) nl = static_cast<int>(event.length());
+  String value = event.substring(colon + 1, nl);
+  value.trim();
+  return value;
 }
 
 int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
@@ -1377,7 +1417,7 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
           // only today's join the scope-highlighting callsigns.
           std::set<String> evCallsigns;
           std::vector<String> designators;
-          scanFlights(event, evCallsigns, &designators);
+          scanFlights(summaryOf(event), evCallsigns, &designators);
           if (isToday) found.insert(evCallsigns.begin(), evCallsigns.end());
           String evIso = evDate.substring(0, 4) + "-" +
                          evDate.substring(4, 6) + "-" + evDate.substring(6);

@@ -178,6 +178,8 @@ void liveStatusToJson(const model::Model& model, JsonDocument& doc) {
   for (size_t i = 0; i < model.specials.size() && i < specials.size(); ++i) {
     specials[i]["found"] =
         feeds::flightTracked(model, model.specials[i].flight);
+    specials[i]["trackable"] =
+        feeds::flightTrackable(model.specials[i].flight);
   }
   JsonArray ical = doc["icalSpecials"].to<JsonArray>();
   for (const auto& special : model.icalSpecials) {
@@ -187,6 +189,7 @@ void liveStatusToJson(const model::Model& model, JsonDocument& doc) {
     object["source"] = special.source;
     object["today"] = special.today;
     object["found"] = feeds::flightTracked(model, special.flight);
+    object["trackable"] = feeds::flightTrackable(special.flight);
   }
   JsonArray feedList = doc["feeds"].as<JsonArray>();
   for (size_t i = 0; i < model.feeds.size() && i < feedList.size(); ++i) {

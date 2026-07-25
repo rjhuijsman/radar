@@ -36,6 +36,11 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex);
 // Callers hold the model mutex.
 bool flightTracked(const model::Model& model, const String& flight);
 
+// True when `flight` can be matched to a broadcast ICAO callsign at all: an
+// ICAO-form entry always, an IATA one only if its airline is in the table.
+// False means detected-but-not-trackable, which the dashboard flags.
+bool flightTrackable(const String& flight);
+
 // Keeps the rain-radar layer current. When the refetch interval has
 // elapsed — or the view has left the fetched tiles and settled — fetches
 // the newest RainViewer frame's Web-Mercator tiles covering the view,
