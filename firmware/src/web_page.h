@@ -34,6 +34,7 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <main>
   <h1>🛩 Radar 720</h1>
   <h2>Default range (NM)</h2>
+  <div class="note">Zoom used at startup and when the knob cycles between homes.</div>
   <div class="row"><input id="range" type="number" min="5" max="240"></div>
   <h2>Homes</h2><div id="homes"></div><button class="add" onclick="add('homes')">+ Home</button>
   <h2>Calendar feeds (iCal)</h2>
@@ -157,6 +158,21 @@ function render() {
       });
       if (key === "specials" && "found" in item) {
         row.appendChild(badge(item.found));
+      }
+      // Homes cycle on the device in list order, so let them be reordered.
+      if (key === "homes") {
+        const mv = (d) => () => {
+          const j = i + d;
+          [data.homes[i], data.homes[j]] = [data.homes[j], data.homes[i]];
+          render();
+        };
+        const up = document.createElement("button");
+        up.className = "x"; up.textContent = "↑"; up.title = "Move up";
+        up.disabled = i === 0; up.onclick = mv(-1);
+        const dn = document.createElement("button");
+        dn.className = "x"; dn.textContent = "↓"; dn.title = "Move down";
+        dn.disabled = i === data.homes.length - 1; dn.onclick = mv(1);
+        row.appendChild(up); row.appendChild(dn);
       }
       const del = document.createElement("button");
       del.className = "x"; del.textContent = "✕";

@@ -136,6 +136,7 @@ enum class Screen { On, PoweringOff, Off, PoweringOn };
 // Transient interaction state driven by the encoder and toggles.
 struct Ui {
   float range = 40.0f;         // Current display range in NM.
+  float defaultRange = 40.0f;  // Zoom applied at boot and home-to-home switch.
   DisplayMode display = DisplayMode::Flights;
   bool geography = false;      // Geography overlay on/off.
   Screen screen = Screen::On;

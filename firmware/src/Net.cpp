@@ -39,7 +39,7 @@ void unlock() {
 // can never be read back over the network.
 void configToJson(const model::Model& model, JsonDocument& doc,
                   bool includeSecrets) {
-  doc["range"] = model.ui.range;
+  doc["range"] = model.ui.defaultRange;
   JsonArray homes = doc["homes"].to<JsonArray>();
   for (const auto& home : model.homes) {
     JsonObject object = homes.add<JsonObject>();
@@ -85,7 +85,9 @@ void configToJson(const model::Model& model, JsonDocument& doc,
 
 // Applies parsed config JSON to the model, then reprojects statics.
 void jsonToConfig(const JsonDocument& doc, model::Model& model) {
-  if (doc["range"].is<float>()) model.ui.range = doc["range"];
+  // The default range is the zoom used at boot and on home-to-home switches;
+  // live zooming changes ui.range but leaves this stored default alone.
+  if (doc["range"].is<float>()) model.ui.defaultRange = doc["range"];
 
   model.homes.clear();
   for (JsonObjectConst object : doc["homes"].as<JsonArrayConst>()) {
@@ -212,6 +214,7 @@ void loadConfig(model::Model& model) {
   JsonDocument doc;
   if (!deserializeJson(doc, file)) jsonToConfig(doc, model);
   file.close();
+  model.ui.range = model.ui.defaultRange;  // Boot opens at the default zoom.
 }
 
 // Accumulates a POST body across chunks, then applies and persists it.

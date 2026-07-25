@@ -149,6 +149,10 @@ void press(Model& model) {
     } else if (!model.homes.empty()) {
       model.ui.homeIndex = (model.ui.homeIndex + 1) %
                            static_cast<int>(model.homes.size());
+      // Home-to-home switches (this branch only, never home<->flight) return
+      // to the configured default zoom.
+      model.ui.range = model.ui.defaultRange;
+      model.ui.lastZoomMs = millis();  // Emphasize the range readout briefly.
       // The world is measured from the active home: aircraft positions
       // from the old home are hundreds of NM off, so drop them and ask
       // the network task for an immediate refetch around the new one;
