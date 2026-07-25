@@ -40,8 +40,8 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
   <div class="note" id="feednote"></div>
   <div id="feeds"></div><button class="add" onclick="add('feeds')">+ Feed</button>
   <h2>Special flights</h2>
-  <div class="note">Highlighted on the scope on their date. Flights found on
-  today's calendar appear below automatically.</div>
+  <div class="note">Highlighted on the scope on their date. Flights from your
+  calendar feeds — today's and upcoming — appear below automatically.</div>
   <div id="specials"></div>
   <div id="icalspecials"></div>
   <button class="add" onclick="add('specials')">+ Flight</button>
@@ -82,6 +82,16 @@ function badge(found) {
     "not be flying here right now.";
   return b;
 }
+// A calendar flight scheduled for a future day: it cannot be tracked yet,
+// so it shows that it is upcoming rather than a live in-view snapshot.
+function upcomingBadge() {
+  const b = document.createElement("span");
+  b.className = "badge off";
+  b.textContent = "○ upcoming";
+  b.title = "Scheduled for a future date; it will flag on the scope on " +
+    "the day of the flight.";
+  return b;
+}
 // One feed's sync line: result and age of the last fetch attempt.
 function feedStatus(item) {
   const st = document.createElement("div");
@@ -92,7 +102,7 @@ function feedStatus(item) {
     st.classList.add("ok");
     const n = item.syncFlights ?? 0;
     st.textContent = `✓ synced ${ago(item.syncAgeS)}, ` +
-      (n ? `${n} flight${n > 1 ? "s" : ""} today` : "no flights today");
+      (n ? `${n} upcoming flight${n > 1 ? "s" : ""}` : "no upcoming flights");
   } else {
     st.classList.add("bad");
     st.textContent = `✗ sync failed ${ago(item.syncAgeS)}`;
@@ -172,10 +182,11 @@ function render() {
     const tag = document.createElement("span");
     tag.className = "tag";
     tag.textContent = "from " + (item.source || "calendar");
-    tag.title = "Found in the calendar feed for today; edit the trip " +
-      "there, not here.";
+    tag.title = "From a calendar feed; edit the trip there, not here.";
     row.appendChild(tag);
-    row.appendChild(badge(item.found));
+    // Today's flights carry the live in-view badge; upcoming ones show
+    // when they will flag, since they cannot be tracked before their day.
+    row.appendChild(item.today ? badge(item.found) : upcomingBadge());
     ihost.appendChild(row);
   });
 }

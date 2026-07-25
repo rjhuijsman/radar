@@ -86,8 +86,9 @@ struct SpecialFlight {
 // each poll; never persisted (the feed itself is the source of truth).
 struct IcalSpecial {
   String flight;  // Designator as found in the event text, e.g. "QR106".
-  String date;    // YYYY-MM-DD (UTC) it matched on — always today.
+  String date;    // YYYY-MM-DD (UTC) of the flight; today or a future day.
   String source;  // Name of the feed it came from.
+  bool today = false;  // True only on the flight's own date (when it flags).
 };
 
 // Live sync state of one calendar feed, keyed by URL so a config save

@@ -763,8 +763,10 @@ const char* skipWs(const char* p, const char* end) {
 }
 
 // Scans the trace JSON for the "trace" array and hands every plottable
-// point's latitude and longitude (fields [1] and [2] of each entry;
-// either may be null) to `fn(lat, lon)`, oldest first. A hand scanner
+// point's latitude, longitude (fields [1] and [2]; either may be null)
+// and on-ground flag (field [3] is the literal string "ground" on the
+// surface, a number aloft) to `fn(lat, lon, onGround)`, oldest first.
+// A hand scanner
 // instead of a real parse: a long-haul day runs to thousands of points,
 // and holding them as an ArduinoJson document costs megabytes of PSRAM
 // the set does not have (observed on-device: NoMemory at ~870 KB of
@@ -803,14 +805,16 @@ void scanTracePoints(const char* json, size_t len, PointFn&& fn) {
     if (*p != '[') return;  // Not a point array: malformed, stop.
     ++p;
 
-    // The first three fields of a point are scalars — timestamp, lat,
-    // lon (a missing fix leaves the coordinates null). Each token is
-    // copied out and parsed bounded, so a number at the very end of
-    // the buffer can never run the parse past it.
+    // Fields [0..2] are scalars — timestamp, lat, lon (a missing fix
+    // leaves the coordinates null) — and [3] is the altitude, the
+    // literal string "ground" on the surface or a number aloft. Each
+    // token is copied out and parsed bounded, so a number at the very
+    // end of the buffer can never run the parse past it.
     float vals[3] = {0, 0, 0};
     bool numeric[3] = {false, false, false};
+    bool onGround = false;
     int fields = 0;
-    for (int f = 0; f < 3; ++f) {
+    for (int f = 0; f < 4; ++f) {
       p = skipWs(p, end);
       const char* tok = p;
       while (p < end && *p != ',' && *p != ']') ++p;
@@ -818,9 +822,13 @@ void scanTracePoints(const char* json, size_t len, PointFn&& fn) {
       size_t n = min(static_cast<size_t>(p - tok), sizeof(buf) - 1);
       memcpy(buf, tok, n);
       buf[n] = 0;
-      char* after = nullptr;
-      vals[f] = strtof(buf, &after);
-      numeric[f] = after != buf;
+      if (f < 3) {
+        char* after = nullptr;
+        vals[f] = strtof(buf, &after);
+        numeric[f] = after != buf;
+      } else {
+        onGround = strstr(buf, "ground") != nullptr;
+      }
       ++fields;
       if (p >= end || *p == ']') break;  // Short point.
       ++p;                               // Past the ','.
@@ -851,7 +859,7 @@ void scanTracePoints(const char* json, size_t len, PointFn&& fn) {
     if (fields < 3 || !numeric[1] || !numeric[2]) continue;
     float lat = vals[1], lon = vals[2];
     if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) continue;
-    fn(lat, lon);
+    fn(lat, lon, onGround);
   }
 }
 
@@ -928,34 +936,51 @@ bool fetchTrace(const model::Home& home, const String& hex,
   }
 
   // Two passes over the text, so the full-day path never lands anywhere
-  // whole: count the plottable points, then keep an even spread of at
-  // most kTraceSeedPoints of them, oldest first, the newest always
+  // whole: first count the plottable points and note the most recent one
+  // on the ground, then keep an even spread of at most kTraceSeedPoints
+  // from the last takeoff onward, oldest first, the newest always
   // included so the history meets the live position.
   const char* text = reinterpret_cast<const char*>(json);
   size_t valid = 0;
-  scanTracePoints(text, jsonLen, [&](float, float) { ++valid; });
+  long lastGround = -1;  // Ordinal of the most recent on-ground point.
+  scanTracePoints(text, jsonLen, [&](float, float, bool onGround) {
+    if (onGround) lastGround = static_cast<long>(valid);
+    ++valid;
+  });
   if (valid == 0) {
     heap_caps_free(json);
     Serial.printf("[feeds] trace: no plottable points for %s.\n", hex.c_str());
     return false;
   }
-  size_t kept = min(valid, kTraceSeedPoints);
+
+  // Trim to the current leg: start at the last takeoff (the most recent
+  // on-ground point), so a plane that flew several legs today shows only
+  // the one it is on. A trace with no ground point at all — already aloft
+  // when the day's trace began, e.g. an overnight long-haul — keeps all
+  // of it.
+  size_t start = lastGround >= 0 ? static_cast<size_t>(lastGround) : 0;
+  size_t leg = valid - start;
+  size_t kept = min(leg, kTraceSeedPoints);
   out.clear();
   out.reserve(kept);
   size_t index = 0, emitted = 0;
-  scanTracePoints(text, jsonLen, [&](float lat, float lon) {
-    size_t want = kept == 1 ? valid - 1 : emitted * (valid - 1) / (kept - 1);
-    if (index++ != want) return;
+  scanTracePoints(text, jsonLen, [&](float lat, float lon, bool) {
+    size_t ord = index++;
+    if (ord < start) return;  // Before the last takeoff.
+    size_t si = ord - start;  // Index within the current leg.
+    size_t want = kept == 1 ? leg - 1 : emitted * (leg - 1) / (kept - 1);
+    if (si != want) return;
     out.push_back(geoToWorld(home, lat, lon));
     ++emitted;
   });
   heap_caps_free(json);
 
   Serial.printf(
-      "[feeds] trace: %s %u B wire -> %u B json, %u pts -> %u kept "
-      "(%lu ms, heap %u KB)\n",
+      "[feeds] trace: %s %u B wire -> %u B json, %u pts (%u since takeoff) "
+      "-> %u kept (%lu ms, heap %u KB)\n",
       hex.c_str(), static_cast<unsigned>(wire), static_cast<unsigned>(jsonLen),
-      static_cast<unsigned>(valid), static_cast<unsigned>(emitted),
+      static_cast<unsigned>(valid), static_cast<unsigned>(leg),
+      static_cast<unsigned>(emitted),
       static_cast<unsigned long>(millis() - started), ESP.getFreeHeap() / 1024);
   return true;
 }
@@ -1201,8 +1226,10 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
     }
   }
 
-  // iCal feeds: parse VEVENTs and keep only flights whose DTSTART is
-  // today, recording per feed what matched and whether the fetch worked.
+  // iCal feeds: parse VEVENTs and keep every flight from today onward, so
+  // an upcoming trip shows in the dashboard the moment it syncs. Only
+  // today's flights join the callsign set that highlights the scope;
+  // future ones are listed with their date and flag when their day comes.
   std::vector<model::IcalSpecial> fromCalendar;
   std::vector<model::FeedStatus> statuses;
   int fetched = 0;
@@ -1228,14 +1255,23 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
           if (evEnd < 0) evEnd = static_cast<int>(body.length());
           idx = evEnd + 1;
           String event = body.substring(evStart, evEnd);
-          if (eventDate(event) != today) continue;
+          String evDate = eventDate(event);  // YYYYMMDD, or "".
+          if (evDate.length() != 8 || evDate < today) continue;  // Past/none.
+          bool isToday = evDate == today;
+          // Collect this event's designators through a throwaway set;
+          // only today's join the scope-highlighting callsigns.
+          std::set<String> evCallsigns;
           std::vector<String> designators;
-          scanFlights(event, found, &designators);
+          scanFlights(event, evCallsigns, &designators);
+          if (isToday) found.insert(evCallsigns.begin(), evCallsigns.end());
+          String evIso = evDate.substring(0, 4) + "-" +
+                         evDate.substring(4, 6) + "-" + evDate.substring(6);
           for (const auto& designator : designators) {
             model::IcalSpecial special;
             special.flight = designator;
-            special.date = todayIso;
+            special.date = evIso;
             special.source = feed.name;
+            special.today = isToday;
             fromCalendar.push_back(special);
           }
         }
@@ -1244,6 +1280,12 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
     }
     statuses.push_back(status);
   }
+
+  // Soonest first: today's flagging flights lead, then upcoming by date.
+  std::sort(fromCalendar.begin(), fromCalendar.end(),
+            [](const model::IcalSpecial& a, const model::IcalSpecial& b) {
+              return a.date < b.date;
+            });
 
   // Publish. The callsign set only feeds the traffic tagging on this same
   // task, so it needs no lock; the dashboard-facing lists go into the

@@ -180,6 +180,7 @@ void liveStatusToJson(const model::Model& model, JsonDocument& doc) {
     object["flight"] = special.flight;
     object["date"] = special.date;
     object["source"] = special.source;
+    object["today"] = special.today;
     object["found"] = feeds::flightTracked(model, special.flight);
   }
   JsonArray feedList = doc["feeds"].as<JsonArray>();
