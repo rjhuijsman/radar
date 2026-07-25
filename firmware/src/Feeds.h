@@ -35,6 +35,18 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex);
 // so it can be called every couple of seconds.
 void pollWeather(model::Model& model, SemaphoreHandle_t mutex);
 
+// Keeps the followed flight's historic trail current. When the follow
+// target changes to an aircraft with a known ICAO hex, fetches its
+// full-day position trace from adsb.lol (served gzipped; inflated
+// on-device), projects it around the active home, and seeds
+// `model.ui.followTrail` with the decimated path so the renderer's live
+// sampling extends it — the trail then reads full history + live tail.
+// The fetch, gunzip and parse all run with no lock held; the mutex is
+// taken only to snapshot the follow target and to publish. Network-free
+// and cheap when the target is unchanged, so it can be called every
+// loop. On any failure the live-only trail is left alone.
+void pollTrace(model::Model& model, SemaphoreHandle_t mutex);
+
 // Recomputes each POI's world position from its lat/lng relative to the
 // active home. Callers hold the model mutex. Call after loading config or
 // switching home.

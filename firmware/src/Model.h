@@ -21,6 +21,7 @@ struct Vec {
 
 struct Aircraft {
   String callsign;   // ICAO callsign as broadcast, e.g. "BAW117".
+  String hex;        // ICAO 24-bit address, lower-case hex; "" if unknown.
   Vec pos;           // Live position, world NM from home.
   float track = 0;   // Degrees, 0 = north.
   float groundSpeed = 0;  // Knots.

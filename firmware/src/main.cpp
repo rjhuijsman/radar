@@ -137,6 +137,9 @@ void networkTask(void*) {
       lastWeather = now;
       feeds::pollWeather(g_model, g_mutex);
     }
+    // The followed flight's historic trail: pollTrace paces itself and
+    // fetches only when the follow target changes to a new aircraft.
+    feeds::pollTrace(g_model, g_mutex);
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }

@@ -8,6 +8,7 @@
 
 #include <esp_heap_caps.h>
 #include <math.h>
+#include <miniz.h>  // The S3 mask ROM's inflate (tinfl); nothing links in.
 #include <time.h>
 
 #include <algorithm>
@@ -110,6 +111,7 @@ class YieldingReader {
 // fetch and parse run without the model mutex.
 struct Parsed {
   String callsign;
+  String hex;  // ICAO 24-bit address, lower-case hex; "" if absent.
   model::Vec pos;
   float track = 0;
   float groundSpeed = 0;
@@ -225,6 +227,7 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
   JsonDocument filter;
   JsonObject fields = filter["ac"].add<JsonObject>();
   fields["flight"] = true;
+  fields["hex"] = true;
   fields["lat"] = true;
   fields["lon"] = true;
   fields["alt_baro"] = true;
@@ -259,6 +262,7 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
 
     Parsed parsed;
     parsed.callsign = callsign;
+    parsed.hex = String(state["hex"] | "");
     parsed.pos = geoToWorld(home, state["lat"], state["lon"]);
     parsed.track = state["track"] | 0.0f;
     parsed.groundSpeed = state["gs"] | 0.0f;
@@ -598,6 +602,295 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
   return true;
 }
 
+// ---- Followed-flight historic trail (adsb.lol traces). ----
+//
+// adsb.lol publishes a per-aircraft trace file: every position it saw in
+// the current UTC day. When a flight is followed, pollTrace fetches that
+// file once, decimates it, and seeds model.ui.followTrail with it, so
+// the dotted trail reaches back along the flight's real path instead of
+// starting where the follow began. The renderer keeps appending its live
+// samples behind the seed — but its bounded-trail cap also drops the
+// OLDEST point for every sample once the trail is long, which would eat
+// the seeded history within minutes. A cheap periodic mend therefore
+// folds the fresh live samples into a canonical history + live tail kept
+// here and republishes it, restoring the historic prefix.
+
+// Trace tuning. The file arrives gzip-compressed no matter what the
+// request advertises (~7 KB wire, ~40 KB inflated for a typical day), so
+// it is inflated on-device with the ROM's tinfl. The size caps refuse
+// anything wildly bigger than a plausible full-day trace; the point caps
+// bound the renderer's per-frame trail walk and the mutex-held publish.
+constexpr size_t kTraceSeedPoints = 80;    // History points seeded per follow.
+constexpr size_t kTraceMaxPoints = 200;    // History + live tail before a thin.
+constexpr size_t kTraceThinTo = 120;       // Thinned size once over the max.
+constexpr uint32_t kTraceCheckMs = 1000;   // Follow-target check cadence.
+constexpr uint32_t kTraceMendMs = 5000;    // Trail-mend cadence.
+constexpr uint32_t kTraceRetryMs = 60000;  // Refetch backoff after a failure.
+constexpr size_t kTraceMaxWireBytes = 1024 * 1024;
+constexpr size_t kTraceMaxJsonBytes = 2 * 1024 * 1024;
+
+// Trace state, only ever touched from the network task.
+String g_traceHex;          // Hex the published history belongs to; "" none.
+String g_traceFailHex;      // Last hex whose fetch failed, for the backoff.
+uint32_t g_traceFailMs = 0;
+uint32_t g_traceCheckMs = 0;
+uint32_t g_traceMendMs = 0;
+std::vector<model::Vec> g_traceFull;  // Canonical history + live tail.
+
+// True for a plain 6-character lower-case ICAO address. TIS-B and
+// anonymized targets ("~" prefix) have no trace file worth asking for.
+bool isIcaoHex(const String& hex) {
+  if (hex.length() != 6) return false;
+  for (int i = 0; i < 6; ++i) {
+    char c = hex[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+  }
+  return true;
+}
+
+// Unwraps a gzip (RFC 1952) member and inflates it with the tinfl
+// decompressor in the S3's mask ROM — the same inflate the ROM loader
+// uses for compressed flashing, so nothing new links in. Returns a PSRAM
+// buffer of `outLen` bytes the caller frees, or nullptr on any framing,
+// size or inflate failure. The trailer's ISIZE sizes the output exactly;
+// the CRC is not rechecked — the JSON parse behind this catches
+// corruption just as surely.
+uint8_t* gunzip(const uint8_t* in, size_t inLen, size_t& outLen) {
+  // Fixed header: magic, method 8 (deflate), flags, mtime, xfl, os.
+  if (inLen < 18 || in[0] != 0x1f || in[1] != 0x8b || in[2] != 8) {
+    return nullptr;
+  }
+  uint8_t flags = in[3];
+  size_t pos = 10;
+  if (flags & 0x04) {  // FEXTRA: 2-byte little-endian length, then data.
+    if (pos + 2 > inLen) return nullptr;
+    pos += 2 + (static_cast<size_t>(in[pos]) |
+                static_cast<size_t>(in[pos + 1]) << 8);
+  }
+  if (flags & 0x08) {  // FNAME, NUL-terminated.
+    while (pos < inLen && in[pos] != 0) ++pos;
+    ++pos;
+  }
+  if (flags & 0x10) {  // FCOMMENT, NUL-terminated.
+    while (pos < inLen && in[pos] != 0) ++pos;
+    ++pos;
+  }
+  if (flags & 0x02) pos += 2;  // FHCRC.
+  // Past the header there must be deflate data plus the 8-byte trailer.
+  if (pos + 8 >= inLen) return nullptr;
+
+  size_t isize = static_cast<size_t>(in[inLen - 4]) |
+                 static_cast<size_t>(in[inLen - 3]) << 8 |
+                 static_cast<size_t>(in[inLen - 2]) << 16 |
+                 static_cast<size_t>(in[inLen - 1]) << 24;
+  if (isize == 0 || isize > kTraceMaxJsonBytes) return nullptr;
+
+  uint8_t* out = static_cast<uint8_t*>(
+      heap_caps_malloc(isize, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  auto* inflator = static_cast<tinfl_decompressor*>(heap_caps_malloc(
+      sizeof(tinfl_decompressor), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (out == nullptr || inflator == nullptr) {
+    heap_caps_free(out);
+    heap_caps_free(inflator);
+    return nullptr;
+  }
+  tinfl_init(inflator);
+  size_t inBytes = inLen - 8 - pos;
+  size_t outBytes = isize;
+  // One whole-buffer call: all input is present and the output is sized
+  // to fit, so no streaming loop is needed.
+  tinfl_status status =
+      tinfl_decompress(inflator, in + pos, &inBytes, out, out, &outBytes,
+                       TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
+  heap_caps_free(inflator);
+  if (status != TINFL_STATUS_DONE || outBytes != isize) {
+    heap_caps_free(out);
+    return nullptr;
+  }
+  outLen = outBytes;
+  return out;
+}
+
+// Reads the whole (compressed) response body into PSRAM, growing as it
+// goes — HTTP/1.0 keeps the stream unframed, but the server does not
+// always announce a length. Returns nullptr past the size cap or on OOM.
+uint8_t* traceReadBody(HTTPClient& http, size_t& len) {
+  YieldingReader reader(http.getStream());
+  size_t cap = 32 * 1024;
+  uint8_t* buf = static_cast<uint8_t*>(
+      heap_caps_malloc(cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (buf == nullptr) return nullptr;
+  len = 0;
+  for (;;) {
+    if (len == cap) {
+      if (cap >= kTraceMaxWireBytes) {
+        heap_caps_free(buf);
+        return nullptr;
+      }
+      cap = min(cap * 2, kTraceMaxWireBytes);
+      uint8_t* grown = static_cast<uint8_t*>(
+          heap_caps_realloc(buf, cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+      if (grown == nullptr) {
+        heap_caps_free(buf);
+        return nullptr;
+      }
+      buf = grown;
+    }
+    size_t n = reader.readBytes(reinterpret_cast<char*>(buf) + len, cap - len);
+    if (n == 0) break;  // End of body (or a stall; the parse decides).
+    len += n;
+  }
+  return buf;
+}
+
+// Fetches `hex`'s full-day trace from adsb.lol and decimates it into at
+// most kTraceSeedPoints world positions, oldest first, with NO lock
+// held. The globe front end 302-redirects to the bare host; the body is
+// gzip regardless of what the request accepts, so it is read whole into
+// PSRAM, inflated there, and only then parsed (filtered, PSRAM-backed,
+// like the traffic path). Returns false on any fetch, size or parse
+// problem — the caller then leaves the live-only trail alone.
+bool fetchTrace(const model::Home& home, const String& hex,
+                std::vector<model::Vec>& out) {
+  if (!WiFi.isConnected()) return false;
+  // Same guard as the traffic path: the TLS session and parser scratch
+  // live on the internal heap, the trace buffers in PSRAM.
+  if (ESP.getFreeHeap() < 40 * 1024 ||
+      heap_caps_get_free_size(MALLOC_CAP_SPIRAM) <
+          kTraceMaxWireBytes + 512 * 1024) {
+    Serial.printf(
+        "[feeds] trace: memory low (heap %u KB, PSRAM %u KB); skipping.\n",
+        ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
+    return false;
+  }
+
+  // The shard directory is the LAST two characters of the hex.
+  String url = "https://globe.adsb.lol/data/traces/" + hex.substring(4) +
+               "/trace_full_" + hex + ".json";
+
+  uint32_t started = millis();
+  WiFiClientSecure client;
+  // TODO(security): install a CA bundle and validate certificates.
+  client.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(kHttpTimeoutMs);
+  http.setTimeout(kHttpTimeoutMs);
+  http.setUserAgent(kUserAgent);
+  http.useHTTP10(true);  // Unframed body, directly readable (as adsb).
+  http.setFollowRedirects(HTTPC_FORCE_FOLLOW_REDIRECTS);
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    // 404 is simply a flight adsb.lol has no trace for.
+    Serial.printf("[feeds] trace: HTTP %d for %s.\n", code, hex.c_str());
+    http.end();
+    return false;
+  }
+  int announced = http.getSize();
+  if (announced > static_cast<int>(kTraceMaxWireBytes)) {
+    Serial.printf("[feeds] trace: %d-byte body refused.\n", announced);
+    http.end();
+    return false;
+  }
+  size_t wire = 0;
+  uint8_t* raw = traceReadBody(http, wire);
+  http.end();
+  if (raw == nullptr || wire == 0) {
+    heap_caps_free(raw);
+    Serial.println("[feeds] trace: body read failed.");
+    return false;
+  }
+
+  // Inflate — unless the server ever starts honoring identity encoding,
+  // in which case the body already opens as JSON and parses as-is.
+  uint8_t* json = raw;
+  size_t jsonLen = wire;
+  if (raw[0] == 0x1f && wire >= 2 && raw[1] == 0x8b) {
+    json = gunzip(raw, wire, jsonLen);
+    if (json == nullptr) {
+      heap_caps_free(raw);
+      Serial.println("[feeds] trace: gunzip failed.");
+      return false;
+    }
+  }
+
+  // Keep only the trace array; the registration/airframe metadata (and
+  // the per-point detail objects' keys the filter can't reach) stay as
+  // small as the parse allows, all of it in PSRAM.
+  JsonDocument filter;
+  filter["trace"] = true;
+  static SpiRamAllocator allocator;
+  JsonDocument doc(&allocator);
+  DeserializationError err =
+      deserializeJson(doc, reinterpret_cast<const char*>(json), jsonLen,
+                      DeserializationOption::Filter(filter));
+  if (json != raw) heap_caps_free(json);
+  heap_caps_free(raw);
+  if (err) {
+    Serial.printf("[feeds] trace: parse failed (%s).\n", err.c_str());
+    return false;
+  }
+  JsonArrayConst trace = doc["trace"].as<JsonArrayConst>();
+  if (trace.isNull()) {
+    Serial.println("[feeds] trace: no 'trace' array.");
+    return false;
+  }
+
+  // Two passes, so the full-day path never lands anywhere whole: count
+  // the plottable points ([1] = lat, [2] = lon; either may be null),
+  // then keep an even spread of at most kTraceSeedPoints of them, oldest
+  // first, the newest always included so the history meets the live
+  // position.
+  size_t valid = 0;
+  for (JsonVariantConst v : trace) {
+    JsonArrayConst pt = v.as<JsonArrayConst>();
+    if (pt.isNull() || pt.size() < 3) continue;
+    if (!pt[1].is<float>() || !pt[2].is<float>()) continue;
+    float lat = pt[1], lon = pt[2];
+    if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) continue;
+    ++valid;
+  }
+  if (valid == 0) {
+    Serial.printf("[feeds] trace: no plottable points for %s.\n", hex.c_str());
+    return false;
+  }
+  size_t kept = min(valid, kTraceSeedPoints);
+  out.clear();
+  out.reserve(kept);
+  size_t index = 0, emitted = 0;
+  for (JsonVariantConst v : trace) {
+    JsonArrayConst pt = v.as<JsonArrayConst>();
+    if (pt.isNull() || pt.size() < 3) continue;
+    if (!pt[1].is<float>() || !pt[2].is<float>()) continue;
+    float lat = pt[1], lon = pt[2];
+    if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) continue;
+    size_t want = kept == 1 ? valid - 1 : emitted * (valid - 1) / (kept - 1);
+    if (index++ != want) continue;
+    out.push_back(geoToWorld(home, lat, lon));
+    ++emitted;
+  }
+
+  Serial.printf(
+      "[feeds] trace: %s %u B wire -> %u B json, %u pts -> %u kept "
+      "(%lu ms, heap %u KB)\n",
+      hex.c_str(), static_cast<unsigned>(wire), static_cast<unsigned>(jsonLen),
+      static_cast<unsigned>(valid), static_cast<unsigned>(emitted),
+      static_cast<unsigned long>(millis() - started), ESP.getFreeHeap() / 1024);
+  return true;
+}
+
+// Thins `points` in place to `target`: an even spread that always keeps
+// the first and the last.
+void thinTrail(std::vector<model::Vec>& points, size_t target) {
+  if (points.size() <= target || target < 2) return;
+  std::vector<model::Vec> kept;
+  kept.reserve(target);
+  for (size_t j = 0; j < target; ++j) {
+    kept.push_back(points[j * (points.size() - 1) / (target - 1)]);
+  }
+  points = std::move(kept);
+}
+
 }  // namespace
 
 bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
@@ -644,6 +937,7 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   for (const auto& parsed : snapshot) {
     model::Aircraft& ac = upsert(model, parsed.callsign);
     bool fresh = ac.fixMs == 0;  // First fix for this aircraft.
+    ac.hex = parsed.hex;
     ac.pos = parsed.pos;
     ac.track = parsed.track;
     ac.groundSpeed = parsed.groundSpeed;
@@ -944,6 +1238,114 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
       static_cast<unsigned long>(ctx.unknown),
       static_cast<unsigned long>(millis() - started), ESP.getFreeHeap() / 1024,
       ESP.getFreePsram() / 1024);
+}
+
+void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
+  uint32_t now = millis();
+  if (now - g_traceCheckMs < kTraceCheckMs) return;
+  g_traceCheckMs = now;
+
+  // Snapshot the follow target and home under the mutex; everything slow
+  // below runs with no lock held.
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  model::Home home = activeHome(model);
+  bool following = model.ui.following && model.ui.followIndex >= 0 &&
+                   model.ui.followIndex < static_cast<int>(model.aircraft.size());
+  String hex = following ? model.aircraft[model.ui.followIndex].hex : String();
+  xSemaphoreGive(mutex);
+
+  if (!following || !isIcaoHex(hex)) {
+    // Not following (or nothing a trace exists for): drop the cached
+    // history, so re-following — even the same flight — reseeds fresh.
+    // The trail itself is Inputs' to clear, on its follow transitions.
+    g_traceHex = "";
+    g_traceFull.clear();
+    g_traceFull.shrink_to_fit();
+    return;
+  }
+
+  if (hex != g_traceHex) {
+    // The follow target changed: fetch its history. Failures (a flight
+    // adsb.lol does not know, a bad transfer) back off and leave the
+    // renderer's live-only trail in place.
+    if (hex == g_traceFailHex && now - g_traceFailMs < kTraceRetryMs) return;
+    std::vector<model::Vec> history;
+    if (!fetchTrace(home, hex, history)) {
+      g_traceFailHex = hex;
+      g_traceFailMs = millis();
+      return;
+    }
+    // Seed under the mutex: history first, then whatever live samples
+    // the renderer collected while the fetch ran. Bail if the follow
+    // moved on (or the home switched) mid-fetch — the positions would
+    // be relative to the wrong flight or the wrong origin.
+    xSemaphoreTake(mutex, portMAX_DELAY);
+    bool still =
+        model.ui.following && model.ui.followIndex >= 0 &&
+        model.ui.followIndex < static_cast<int>(model.aircraft.size()) &&
+        model.aircraft[model.ui.followIndex].hex == hex &&
+        activeHome(model).name == home.name;
+    if (still) {
+      history.insert(history.end(), model.ui.followTrail.begin(),
+                     model.ui.followTrail.end());
+      model.ui.followTrail = history;
+      g_traceFull = std::move(history);
+      g_traceHex = hex;
+      g_traceMendMs = now;
+    }
+    xSemaphoreGive(mutex);
+    if (!still) {
+      Serial.println("[feeds] trace: follow changed mid-fetch; dropped.");
+    }
+    return;
+  }
+
+  // Same target, already seeded: mend the trail. The renderer's bounded
+  // cap drops the oldest point for every live sample it appends past the
+  // cap, which would eat the seeded history within minutes; this merge
+  // folds the fresh live samples into the canonical trail kept here and
+  // republishes it, restoring the historic prefix. Brief and small (a
+  // couple hundred 8-byte points), so it is fine under the mutex.
+  if (now - g_traceMendMs < kTraceMendMs) return;
+  g_traceMendMs = now;
+
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  bool still = model.ui.following && model.ui.followIndex >= 0 &&
+               model.ui.followIndex < static_cast<int>(model.aircraft.size()) &&
+               model.aircraft[model.ui.followIndex].hex == hex;
+  if (still) {
+    std::vector<model::Vec>& cur = model.ui.followTrail;
+    // The renderer only appends at the back and erodes at the front, so
+    // the current front sits somewhere in the canonical trail (bit-exact:
+    // both sides are verbatim copies); anything past the surviving
+    // overlap is new live tail.
+    size_t at = g_traceFull.size();
+    if (!cur.empty()) {
+      for (size_t i = 0; i < g_traceFull.size(); ++i) {
+        if (g_traceFull[i].x == cur.front().x &&
+            g_traceFull[i].y == cur.front().y) {
+          at = i;
+          break;
+        }
+      }
+    }
+    if (at == g_traceFull.size()) {
+      // No overlap left (e.g. the trail was cleared and regrown between
+      // checks): everything current is new.
+      g_traceFull.insert(g_traceFull.end(), cur.begin(), cur.end());
+    } else {
+      size_t overlap = g_traceFull.size() - at;
+      if (cur.size() > overlap) {
+        g_traceFull.insert(g_traceFull.end(), cur.begin() + overlap,
+                           cur.end());
+      }
+    }
+    if (g_traceFull.size() > kTraceMaxPoints) {
+      thinTrail(g_traceFull, kTraceThinTo);
+    }
+    cur = g_traceFull;
+  }
+  xSemaphoreGive(mutex);
 }
 
 void reprojectStatics(model::Model& model) {
