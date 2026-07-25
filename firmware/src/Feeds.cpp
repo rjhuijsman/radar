@@ -29,6 +29,12 @@ namespace {
 // aircraft on a summer afternoon).
 constexpr int kFetchRadiusNm = 250;
 constexpr size_t kMaxAircraft = 150;
+// A special flight beyond the fetch circle is absent from the radius
+// response entirely, so each traffic poll follows up with world-wide
+// callsign lookups for the active special callsigns the circle did not
+// deliver. The cap bounds the extra HTTPS requests a long specials list
+// could otherwise queue every poll.
+constexpr size_t kMaxGlobalLookups = 8;
 constexpr uint32_t kHttpTimeoutMs = 20000;
 constexpr char kUserAgent[] = "radar-720 (ESP32-S3 flight radar)";
 
@@ -291,6 +297,71 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
     out.push_back(std::move(parsed));
   }
   return true;
+}
+
+// Looks up each callsign in `wanted` world-wide — api.adsb.lol serves a
+// per-callsign query whose response mirrors the traffic records — and
+// appends every airborne match to `out` tagged special, with NO lock
+// held. One TLS session is reused across the lookups; they all hit the
+// same host. A callsign whose lookup FAILED (fetch or parse, as opposed
+// to a clean "not airborne" empty result) goes into `failed`, so the
+// caller can keep a previously merged flight alive through the hiccup.
+void fetchGlobalSpecials(const model::Home& home,
+                         const std::vector<String>& wanted,
+                         std::vector<Parsed>& out, std::set<String>& failed) {
+  WiFiClientSecure client;
+  // TODO(security): install a CA bundle and validate certificates.
+  client.setInsecure();
+  HTTPClient http;
+  http.setConnectTimeout(kHttpTimeoutMs);
+  http.setTimeout(kHttpTimeoutMs);
+  http.setUserAgent(kUserAgent);
+  http.setReuse(true);  // The lookups share one host (and TLS session).
+  for (const String& callsign : wanted) {
+    bool ok = false;
+    // The internal-heap guard matches the traffic path: the TLS session
+    // and scratch live there, and skipping a lookup is invisible.
+    if (WiFi.isConnected() && ESP.getFreeHeap() >= 40 * 1024 &&
+        http.begin(client, "https://api.adsb.lol/v2/callsign/" + callsign)) {
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
+        // The body is a handful of aircraft at most, so the String
+        // round-trip is fine; an empty "ac" array is simply a callsign
+        // not airborne right now.
+        static SpiRamAllocator allocator;
+        JsonDocument doc(&allocator);
+        if (deserializeJson(doc, http.getString()) ==
+                DeserializationError::Ok &&
+            doc["ac"].is<JsonArrayConst>()) {
+          ok = true;
+          for (JsonObjectConst state : doc["ac"].as<JsonArrayConst>()) {
+            const char* flight = state["flight"];
+            if (flight == nullptr) continue;
+            String broadcast = String(flight);
+            broadcast.trim();
+            if (broadcast.isEmpty()) continue;
+            if (!state["lat"].is<float>() || !state["lon"].is<float>()) {
+              continue;
+            }
+            Parsed parsed;
+            parsed.callsign = broadcast;
+            parsed.hex = String(state["hex"] | "");
+            parsed.pos = geoToWorld(home, state["lat"], state["lon"]);
+            parsed.track = state["track"] | 0.0f;
+            parsed.groundSpeed = state["gs"] | 0.0f;
+            parsed.altitude = state["alt_baro"] | 0;
+            parsed.special = true;  // Looked up because it is one.
+            out.push_back(std::move(parsed));
+          }
+        }
+      } else {
+        Serial.printf("[feeds] adsb: global HTTP %d for %s.\n", code,
+                      callsign.c_str());
+      }
+      http.end();
+    }
+    if (!ok) failed.insert(callsign);
+  }
 }
 
 // Snapshot-cap ordering: special (calendar-matched) flights always survive
@@ -1008,6 +1079,45 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
     snapshot.resize(kMaxAircraft);
   }
 
+  // Follow up on the active special callsigns the circle did not
+  // deliver: a special flight can be airborne anywhere on Earth, so the
+  // absent forms are looked up globally and any match merged in beside
+  // the radius traffic (a flight-number entry expands to several
+  // candidate forms, most of which are legitimately never airborne).
+  // Forms past the lookup cap — and lookups that failed — land in
+  // `held`, which below keeps a previously merged aircraft on the scope
+  // with its last data instead of blinking it off for a poll.
+  std::set<String> have;
+  for (const auto& parsed : snapshot) have.insert(parsed.callsign);
+  std::vector<String> wanted;
+  std::set<String> held;
+  for (const String& callsign : g_specials) {
+    if (have.count(callsign) > 0) continue;
+    if (wanted.size() < kMaxGlobalLookups) {
+      wanted.push_back(callsign);
+    } else {
+      held.insert(callsign);
+    }
+  }
+  if (!wanted.empty()) {
+    std::vector<Parsed> global;
+    fetchGlobalSpecials(home, wanted, global, held);
+    size_t merged = 0;
+    for (auto& parsed : global) {
+      // Dedupe by broadcast callsign, so a special that was in the
+      // radius data after all (or answers two candidate forms) is
+      // never doubled.
+      if (have.insert(parsed.callsign).second) {
+        snapshot.push_back(std::move(parsed));
+        ++merged;
+      }
+    }
+    Serial.printf(
+        "[feeds] adsb: %u global special lookup(s) -> %u merged, %u held.\n",
+        static_cast<unsigned>(wanted.size()), static_cast<unsigned>(merged),
+        static_cast<unsigned>(held.size()));
+  }
+
   // Merge under the mutex, briefly: upsert so each blip's sweep-refresh
   // state carries across polls, then drop aircraft that left the feed.
   xSemaphoreTake(mutex, portMAX_DELAY);
@@ -1044,6 +1154,11 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
     // it was through later fixes' corrections.
     if (fresh) ac.est = ac.pos;
     present.insert(parsed.callsign);
+  }
+  // Keep any aircraft a held form covers: its global lookup failed or
+  // was deferred this poll, which says nothing about the flight itself.
+  for (const auto& ac : model.aircraft) {
+    if (held.count(ac.callsign) > 0) present.insert(ac.callsign);
   }
   for (int i = static_cast<int>(model.aircraft.size()) - 1; i >= 0; --i) {
     if (present.count(model.aircraft[i].callsign) == 0) {

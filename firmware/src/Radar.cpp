@@ -283,13 +283,27 @@ void drawPoi(Arduino_GFX* gfx, const Model& model, const model::Poi& poi) {
 // the arrow points at the same spot the blip will appear. The bearing is
 // quantized to the same grid the redraw fingerprint uses, so a repaint
 // between fingerprint steps reproduces the previous pixels exactly.
+// `selected`/`candidate` mark the flight the encoder browse is resting
+// on: its chevron grows and gains the blips' selection reticle, so an
+// off-scope flight reads as "about to be committed" as clearly as an
+// on-scope blip does.
 void drawEdgeArrow(Arduino_GFX* gfx, const Model& model, const Aircraft& ac,
-                   float distance, const Vec& at) {
-  uint16_t c = dim(ac.special ? C_AMBER : C_WHITE, model.ui.brightness);
+                   float distance, const Vec& at, bool selected,
+                   bool candidate) {
+  float k = model.ui.brightness;
+  uint16_t c = dim(ac.special ? C_AMBER : C_WHITE, k);
   float bearing = lroundf(bearingFrom(model, at) * 4.0f) / 4.0f;
   float x, y;
   polar(bearing, kRadius * 0.985f, x, y);
-  drawTriangle(gfx, x, y, bearing + 180, 1.1f, c);  // Chevron points out.
+  // Chevron points out; the browse target's is half again as large.
+  drawTriangle(gfx, x, y, bearing + 180, (selected || candidate) ? 1.6f : 1.1f,
+               c);
+  if (selected || candidate) {
+    // The same reticle the on-scope blips carry, in the same colors.
+    uint16_t rc = dim(candidate ? C_AMBER : C_WHITE, k);
+    gfx->drawRect(static_cast<int16_t>(x) - 17, static_cast<int16_t>(y) - 17,
+                  34, 34, rc);
+  }
   float lx, ly;
   polar(bearing, kRadius * 0.86f, lx, ly);
   drawLabel(gfx, lx - 16, ly - 6, ac.callsign, c);
@@ -315,7 +329,7 @@ void drawAircraft(Arduino_GFX* gfx, const Model& model, Aircraft& ac,
     // panning to it; the arrow keeps it pointed at until the pan lands.
     if (ac.special || selected || candidate || followed) {
       g_live->beginTrack();
-      drawEdgeArrow(gfx, model, ac, distance, at);
+      drawEdgeArrow(gfx, model, ac, distance, at, selected, candidate);
       endTrackPush();
     }
     return;
