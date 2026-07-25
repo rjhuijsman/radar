@@ -1,8 +1,10 @@
 #include "Radar.h"
 
+#include <esp_heap_caps.h>
 #include <math.h>
 #include <string.h>
 
+#include <utility>
 #include <vector>
 
 #include "Display.h"
@@ -154,6 +156,16 @@ void endTrackPush() {
 // flights keep their labels at any range.
 constexpr float kLabelMaxRangeNm = 120.0f;
 
+// The afterglow fade is drawn in discrete steps: the step index feeds
+// both the blip's brightness and its redraw fingerprint, so a blip
+// repaints sixteen times per sweep instead of every frame. A four-
+// percent brightness step every ~1.7 s reads as a continuous ramp, and
+// in a packed sky the step rate sets the whole erase-and-repaint load.
+constexpr float kFadeSteps = 16.0f;
+int fadeStepOf(const Aircraft& ac) {
+  return static_cast<int>(ac.freshness * kFadeSteps);
+}
+
 void drawTriangle(Arduino_GFX* gfx, float cx, float cy, float trackDeg,
                   float scale, uint16_t color) {
   // Local nose-up triangle, rotated to the track.
@@ -229,6 +241,8 @@ void drawSweep(Arduino_GFX* gfx, const Model& model, float fade) {
 void drawHomeMarker(Arduino_GFX* gfx, const Model& model) {
   float x, y;
   project(model, Vec{0, 0}, x, y);
+  x = floorf(x);  // Whole-pixel anchor; see drawAircraft.
+  y = floorf(y);
   if (hypotf(x - kCenterX, y - kCenterY) > kRadius) return;
   uint16_t c = dim(C_WHITE, model.ui.brightness);
   gfx->drawLine(x - 10, y, x + 10, y, c);
@@ -239,6 +253,8 @@ void drawHomeMarker(Arduino_GFX* gfx, const Model& model) {
 void drawPoi(Arduino_GFX* gfx, const Model& model, const model::Poi& poi) {
   float x, y;
   project(model, poi.pos, x, y);
+  x = floorf(x);  // Whole-pixel anchor; see drawAircraft.
+  y = floorf(y);
   uint16_t c = dim(C_CYAN, model.ui.brightness);
   if (poi.isAirport) {
     gfx->drawCircle(x, y, 9, c);
@@ -257,11 +273,13 @@ void drawPoi(Arduino_GFX* gfx, const Model& model, const model::Poi& poi) {
 }
 
 // `at` is where the flight is being drawn (sweep-painted or smoothed), so
-// the arrow points at the same spot the blip will appear.
+// the arrow points at the same spot the blip will appear. The bearing is
+// quantized to the same grid the redraw fingerprint uses, so a repaint
+// between fingerprint steps reproduces the previous pixels exactly.
 void drawEdgeArrow(Arduino_GFX* gfx, const Model& model, const Aircraft& ac,
                    float distance, const Vec& at) {
   uint16_t c = dim(ac.special ? C_AMBER : C_WHITE, model.ui.brightness);
-  float bearing = bearingFrom(model, at);
+  float bearing = lroundf(bearingFrom(model, at) * 4.0f) / 4.0f;
   float x, y;
   polar(bearing, kRadius * 0.985f, x, y);
   drawTriangle(gfx, x, y, bearing + 180, 1.1f, c);  // Chevron points out.
@@ -297,37 +315,54 @@ void drawAircraft(Arduino_GFX* gfx, const Model& model, Aircraft& ac,
   }
 
   float k = model.ui.brightness;
-  float bright = followed ? 1.0f : (0.35f + 0.65f * ac.freshness);
+  float bright =
+      followed ? 1.0f : (0.35f + 0.65f * fadeStepOf(ac) / kFadeSteps);
   uint16_t color = dim(ac.special ? C_AMBER : C_GREEN, k * bright);
+
+  // The non-followed blip draws entirely from the sweep-painted
+  // snapshots — position, leading line, nose and label all hold what the
+  // sweep last saw, instead of the direction vectors swinging on every
+  // poll ahead of it. The followed flight is actively dead-reckoned, so
+  // it keeps the live values.
+  float track = followed ? ac.track : ac.shownTrack;
+  float speed = followed ? ac.groundSpeed : ac.shownSpeed;
+  int32_t altitude = followed ? ac.altitude : ac.shownAlt;
 
   float x, y;
   project(model, at, x, y);
+  x = floorf(x);  // Whole-pixel anchors: a repaint between fingerprint
+  y = floorf(y);  // steps reproduces the previous pixels exactly.
 
   // Leading line: one minute ahead along the track.
-  float ahead = ac.groundSpeed / 60.0f;
-  Vec tip{at.x + sinf(ac.track * DEG_TO_RAD) * ahead,
-          at.y + cosf(ac.track * DEG_TO_RAD) * ahead};
+  float ahead = speed / 60.0f;
+  Vec tip{at.x + sinf(track * DEG_TO_RAD) * ahead,
+          at.y + cosf(track * DEG_TO_RAD) * ahead};
   float tx, ty;
   project(model, tip, tx, ty);
+  tx = floorf(tx);
+  ty = floorf(ty);
   gfx->drawLine(x, y, tx, ty, color);
   g_curSegs.push_back(Seg{static_cast<int16_t>(x), static_cast<int16_t>(y),
                           static_cast<int16_t>(tx), static_cast<int16_t>(ty)});
 
+  // Glyph cluster and label block track as separate boxes (see Elem):
+  // the union of the two is mostly empty space.
   g_live->beginTrack();
   if (ac.special) gfx->drawCircle(x, y, 13, dim(C_AMBER, k * bright));
-  drawTriangle(gfx, x, y, ac.track, followed ? 1.2f : 1.0f, color);
-
-  if (model.ui.range <= kLabelMaxRangeNm || followed || selected ||
-      candidate || ac.special) {
-    drawLabel(gfx, x + 12, y - 4, ac.callsign, color);
-    String block = String(ac.altitude) + "  " +
-                   String(static_cast<int>(ac.groundSpeed)) + "kt";
-    drawLabel(gfx, x + 12, y + 8, block, dim(C_WHITE, k * bright));
-  }
-
+  drawTriangle(gfx, x, y, track, followed ? 1.2f : 1.0f, color);
   if (selected || candidate) {
     uint16_t rc = dim(candidate ? C_AMBER : C_WHITE, k);
     gfx->drawRect(x - 17, y - 17, 34, 34, rc);  // Selection reticle.
+  }
+  endTrackPush();
+
+  g_live->beginTrack();
+  if (model.ui.range <= kLabelMaxRangeNm || followed || selected ||
+      candidate || ac.special) {
+    drawLabel(gfx, x + 12, y - 4, ac.callsign, color);
+    String block = String(altitude) + "  " +
+                   String(static_cast<int>(speed)) + "kt";
+    drawLabel(gfx, x + 12, y + 8, block, dim(C_WHITE, k * bright));
   }
   if (followed) drawLabel(gfx, x + 12, y - 16, "FOLLOW", dim(C_AMBER, k));
   endTrackPush();
@@ -393,12 +428,17 @@ bool geoClipSegment(float& x0, float& y0, float& x1, float& y1, uint8_t c0,
 // Draws one polyline set through the folded projection sx = lon*ax+bx,
 // sy = lat*ay+by (lat/lon in fixed-point units): two multiply-adds
 // and an outcode per vertex, so culling the whole of Europe down to
-// the visible segments costs almost nothing.
-void drawGeoSet(Arduino_GFX* gfx, const int16_t (*pts)[2],
-                const uint16_t* lens, int lineCount, float ax, float bx,
-                float ay, float by, uint16_t color) {
+// the visible segments costs almost nothing. Resumable for the sliced
+// rebuild: draws at most `maxLines` polylines starting at `firstLine`
+// and returns the index to continue from.
+int drawGeoSet(Arduino_GFX* gfx, const int16_t (*pts)[2],
+               const uint16_t* lens, int lineCount, int firstLine,
+               int maxLines, float ax, float bx, float ay, float by,
+               uint16_t color) {
   int base = 0;
-  for (int line = 0; line < lineCount; ++line) {
+  for (int line = 0; line < firstLine; ++line) base += lens[line];
+  int last = min(firstLine + maxLines, lineCount);
+  for (int line = firstLine; line < last; ++line) {
     int n = lens[line];
     float px = pts[base][1] * ax + bx;
     float py = pts[base][0] * ay + by;
@@ -419,17 +459,18 @@ void drawGeoSet(Arduino_GFX* gfx, const int16_t (*pts)[2],
     }
     base += n;
   }
+  return last;
 }
 
-// Draws the coastlines and country borders around the active home.
-// Dim cyan in both palettes — it reads as background terrain under
-// the green and the blue phosphor alike — with borders a step dimmer
-// than the coast so the physical outline dominates.
-void drawGeography(Arduino_GFX* gfx, const Model& model) {
-  // Anchor the projection at the active home, matching the feeds'
-  // geoToWorld: world NM east/north via the local equirectangular
-  // approximation, then project()'s view-center shift and NM-to-pixel
-  // scale, all folded into one multiply-add per axis.
+// The home-anchored projection fold shared by the geography and airport
+// layers: anchor at the active home, matching the feeds' geoToWorld —
+// world NM east/north via the local equirectangular approximation, then
+// project()'s view-center shift and NM-to-pixel scale, all folded into
+// one multiply-add per axis (lat/lon in `degPerUnit` fixed-point).
+struct GeoFold {
+  float ax, bx, ay, by;
+};
+GeoFold geoFoldOf(const Model& model, float degPerUnit) {
   float homeLat = 0, homeLon = 0;
   if (model.ui.homeIndex >= 0 &&
       model.ui.homeIndex < static_cast<int>(model.homes.size())) {
@@ -438,17 +479,19 @@ void drawGeography(Arduino_GFX* gfx, const Model& model) {
   }
   float ppn = pixelsPerNm(model);
   float lonNm = 60.0f * cosf(homeLat * DEG_TO_RAD);  // NM per degree lon.
-  float ax = geodata::kDegPerUnit * lonNm * ppn;
-  float bx = kCenterX - (homeLon * lonNm + model.ui.viewCenter.x) * ppn;
-  float ay = -geodata::kDegPerUnit * 60.0f * ppn;
-  float by = kCenterY + (homeLat * 60.0f + model.ui.viewCenter.y) * ppn;
-
-  float k = model.ui.brightness;
-  drawGeoSet(gfx, geodata::kBorderPts, geodata::kBorderLen,
-             geodata::kBorderLines, ax, bx, ay, by, dim(C_CYAN, k * 0.35f));
-  drawGeoSet(gfx, geodata::kCoastPts, geodata::kCoastLen,
-             geodata::kCoastLines, ax, bx, ay, by, dim(C_CYAN, k * 0.55f));
+  GeoFold f;
+  f.ax = degPerUnit * lonNm * ppn;
+  f.bx = kCenterX - (homeLon * lonNm + model.ui.viewCenter.x) * ppn;
+  f.ay = -degPerUnit * 60.0f * ppn;
+  f.by = kCenterY + (homeLat * 60.0f + model.ui.viewCenter.y) * ppn;
+  return f;
 }
+
+// Geography colors: dim cyan in both palettes — it reads as background
+// terrain under the green and the blue phosphor alike — with borders a
+// step dimmer than the coast so the physical outline dominates.
+constexpr float kGeoBorderDim = 0.35f;
+constexpr float kGeoCoastDim = 0.55f;
 
 // ---- Airport basemap (embedded OurAirports major airports). ----
 //
@@ -469,21 +512,21 @@ constexpr float kAirportDedupeNm = 1.5f;
 // Draws the airports around the active home. Sits a step above the
 // geography's dim cyan and below the full-cyan user POIs, so the
 // basemap hierarchy reads terrain, then airports, then your places.
-void drawAirports(Arduino_GFX* gfx, const Model& model) {
-  // The same home-anchored fold as drawGeography: screen x/y are one
+// Resumable for the sliced rebuild: draws at most `maxCount` airports
+// starting at `firstIdx` and returns the index to continue from (the
+// visible count when finished).
+int drawAirports(Arduino_GFX* gfx, const Model& model, int firstIdx,
+                 int maxCount) {
+  // The same home-anchored fold as the geography: screen x/y are one
   // multiply-add from the fixed-point lat/lon.
+  GeoFold f = geoFoldOf(model, airportdata::kDegPerUnit);
   float homeLat = 0, homeLon = 0;
   if (model.ui.homeIndex >= 0 &&
       model.ui.homeIndex < static_cast<int>(model.homes.size())) {
     homeLat = model.homes[model.ui.homeIndex].latitude;
     homeLon = model.homes[model.ui.homeIndex].longitude;
   }
-  float ppn = pixelsPerNm(model);
   float lonNm = 60.0f * cosf(homeLat * DEG_TO_RAD);  // NM per degree lon.
-  float ax = airportdata::kDegPerUnit * lonNm * ppn;
-  float bx = kCenterX - (homeLon * lonNm + model.ui.viewCenter.x) * ppn;
-  float ay = -airportdata::kDegPerUnit * 60.0f * ppn;
-  float by = kCenterY + (homeLat * 60.0f + model.ui.viewCenter.y) * ppn;
 
   // Declutter: medium fields reveal only when zoomed in, and the IATA
   // labels obey the same cutoff as the bulk-traffic labels.
@@ -491,15 +534,16 @@ void drawAirports(Arduino_GFX* gfx, const Model& model) {
   int count = model.ui.range <= kMediumAirportMaxRangeNm
                   ? airportdata::kCount
                   : airportdata::kLargeCount;
+  int last = min(firstIdx + maxCount, count);
   float k = model.ui.brightness;
   uint16_t glyph = dim(C_CYAN, k * 0.8f);
   uint16_t text = dim(C_CYAN, k * 0.65f);
   gfx->setTextSize(1);
   gfx->setTextColor(text);
-  for (int i = 0; i < count; ++i) {
+  for (int i = firstIdx; i < last; ++i) {
     const airportdata::Airport& ap = airportdata::kAirports[i];
-    float x = ap.lon * ax + bx;
-    float y = ap.lat * ay + by;
+    float x = ap.lon * f.ax + f.bx;
+    float y = ap.lat * f.ay + f.by;
     // Cheap cull, with margin for the glyph and label.
     if (x < -20 || x > config::PANEL_WIDTH + 20 || y < -20 ||
         y > config::PANEL_HEIGHT + 20) {
@@ -535,6 +579,7 @@ void drawAirports(Arduino_GFX* gfx, const Model& model) {
       gfx->print(ap.iata);
     }
   }
+  return last;
 }
 
 // ---- Weather underlay (RainViewer reflectivity mosaic). ----
@@ -574,7 +619,11 @@ bool weatherUsable(const Model& model) {
          millis() - model.weather.fetchedMs < kWxStaleMs;
 }
 
-void drawWeather(Arduino_GFX* gfx, const Model& model) {
+// Draws the weather cells whose cell-row indices lie in [rowFrom,
+// rowTo) — resumable for the sliced rebuild; blocking callers pass the
+// full range. One cell row is y0 = row * kWxCellPx.
+void drawWeatherRows(Arduino_GFX* gfx, const Model& model, int rowFrom,
+                     int rowTo) {
   if (!weatherUsable(model)) return;  // No data (yet): a clear scope.
   const model::WeatherLayer& wx = model.weather;
 
@@ -603,7 +652,9 @@ void drawWeather(Arduino_GFX* gfx, const Model& model) {
                       dim(C_WX_HEAVY, k), dim(C_WX_INTENSE, k)};
   float r2 = kRadius * kRadius;
 
-  for (int y0 = 0; y0 < config::PANEL_HEIGHT; y0 += kWxCellPx) {
+  for (int cellRow = rowFrom; cellRow < rowTo; ++cellRow) {
+    int y0 = cellRow * kWxCellPx;
+    if (y0 >= config::PANEL_HEIGHT) break;
     float cy = y0 + kWxCellPx * 0.5f;
     float dy = cy - kCenterY;
     float worldY = model.ui.viewCenter.y + (kCenterY - cy) / ppn;
@@ -653,7 +704,7 @@ void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model, float fade) {
 
   // Input-test line: flashes the most recent control event below the title so
   // the offline screen doubles as a wiring check. Fades out over ~2500 ms.
-  // Drawn INSIDE the acquiring-signal element's tracked span (see drawDynamic),
+  // Drawn INSIDE the acquiring-signal element's tracked span (see drawElem),
   // so the dirty-rect box grows to cover it and it is erased and repainted
   // every frame with no ghosting.
   if (model.ui.lastInput.length() > 0) {
@@ -677,7 +728,7 @@ void drawAcquiringSignal(Arduino_GFX* gfx, const Model& model, float fade) {
 // changes, the new state flashes centered below the home marker and fades
 // out over 2.5 s, echoing the offline input-test line. Knob events show
 // nothing here — the reticle and zoom are their own feedback. Drawn inside
-// a tracked span (see drawDynamic), so the dirty-rect system erases it
+// a tracked span (see drawElem), so the dirty-rect system erases it
 // cleanly with no ghosting.
 void drawToggleFlash(Arduino_GFX* gfx, const Model& model) {
   if (model.ui.lastInput.isEmpty()) return;
@@ -719,6 +770,17 @@ void drawToggleFlash(Arduino_GFX* gfx, const Model& model) {
 // buffer the scan raced the erase-then-redraw pass, which showed as flickering
 // blips (worst in the late-scanned bottom half) and a half-erased sweep.
 // Erasing every old box before drawing any new one keeps overlaps correct.
+//
+// Two refinements keep a busy sky inside the ~40 ms frame budget:
+//   * Change-driven redraw: every moving element carries a fingerprint
+//     (key) of everything that affects its pixels. An element whose key
+//     is unchanged — and whose pixels nothing else disturbed — is left
+//     in place instead of being erased and repainted; the sweep-gated
+//     snapshots and the stepped afterglow keep bulk-traffic keys stable
+//     between sweep passes, so a steady frame repaints a handful of
+//     elements, not the whole sky.
+//   * The follow-pan pipeline (below): view drift rebuilds the static
+//     scene in time-budgeted slices instead of one blocking pass.
 
 Arduino_GFX* g_static = nullptr;  // Off-screen static-reference surface.
 uint16_t* g_targetFb = nullptr;   // Framebuffer the restores write into.
@@ -755,15 +817,35 @@ struct StaticSig {
 };
 StaticSig g_sig;
 
+// A moving element drawn into a framebuffer: identity, the fingerprint
+// of everything that affected its pixels, and the erase bookkeeping
+// captured when it was drawn — up to two boxes (an aircraft tracks its
+// glyph and its label block separately: their union is mostly empty
+// space, and in a packed sky that dead area is what makes every erase
+// disturb its neighbors) and one line segment.
+struct Elem {
+  uint32_t id = 0;
+  uint32_t key = 0;
+  Rect rect{0, 0, 0, 0};
+  Rect rect2{0, 0, 0, 0};
+  Seg seg{0, 0, 0, 0};
+  bool hasRect = false;
+  bool hasRect2 = false;
+  bool hasSeg = false;
+};
+
 // What each framebuffer currently shows, so rendering into it again (two
-// frames later) can erase exactly that. `dirty` marks a buffer whose whole
-// content must be repainted from the static reference first.
+// frames later) can erase or carry exactly that. `dirty` marks a buffer
+// whose whole content must be repainted from the static reference
+// first. `repaintRow` is the pipeline's progressive-repaint watermark:
+// rows above it match the active reference, rows below may still show
+// the previous one (see the follow-pan pipeline below).
 struct FbState {
-  std::vector<Rect> rects;  // Moving-element boxes.
-  std::vector<Seg> segs;    // Leading lines.
+  std::vector<Elem> elems;  // Moving elements, ascending by id.
   int16_t sweepX = 0, sweepY = 0;  // Sweep endpoint (start is the center).
   bool haveSweep = false;
   bool dirty = true;
+  int16_t repaintRow = 0;
 };
 FbState g_fb[2];
 
@@ -840,21 +922,31 @@ void restorePixel(int x, int y) {
   g_targetFb[off] = g_staticFb[off];
 }
 
-// Restores the static pixels under a previously drawn line (the sweep or a
-// leading line), with a 3x3 brush so a one-pixel rasteriser difference
-// cannot leave a glowing trail behind.
+// Restores the static pixels under a previously drawn line (the sweep or
+// a leading line). The brush spans one pixel to each side along the
+// line's minor axis, so a one-pixel rasteriser tie-break difference
+// cannot leave a glowing trail behind — at a third of the cost of the
+// full 3x3 brush this erase used to sweep along the line (the sweep's
+// ~300-pixel erase runs every frame, so its constant factor matters).
 void restoreSeg(int x0, int y0, int x1, int y1) {
   int dx = x1 - x0;
   if (dx < 0) dx = -dx;
   int dy = y1 - y0;
   if (dy < 0) dy = -dy;
+  bool steep = dy > dx;
   dy = -dy;
   int sx = x0 < x1 ? 1 : -1;
   int sy = y0 < y1 ? 1 : -1;
   int err = dx + dy;
   for (;;) {
-    for (int by = -1; by <= 1; ++by) {
-      for (int bx = -1; bx <= 1; ++bx) restorePixel(x0 + bx, y0 + by);
+    if (steep) {  // Mostly vertical: brush across x.
+      restorePixel(x0 - 1, y0);
+      restorePixel(x0, y0);
+      restorePixel(x0 + 1, y0);
+    } else {  // Mostly horizontal: brush across y.
+      restorePixel(x0, y0 - 1);
+      restorePixel(x0, y0);
+      restorePixel(x0, y0 + 1);
     }
     if (x0 == x1 && y0 == y1) break;
     int e2 = 2 * err;
@@ -953,77 +1045,568 @@ void drawFollowTrail(Arduino_GFX* gfx, const Model& model) {
   }
 }
 
-void renderStatic(Model& model) {
-  g_static->fillScreen(C_BG);
-  if (model.ui.online && showWeather(model)) drawWeather(g_static, model);
-  drawBackground(g_static, model);
-  if (model.ui.geography) drawGeography(g_static, model);
-  // Airports ride the flights layer (they hide in weather-only mode,
-  // like the traffic and POIs), independent of the Geography toggle.
-  if (showFlights(model)) drawAirports(g_static, model);
-  if (model.ui.following) drawFollowTrail(g_static, model);
-  drawHomeName(g_static, model);
-  drawRangeReadout(g_static, model);
+// ---- Static-scene painter, resumable in time-budgeted slices. ----
+//
+// The scene is painted through a small unit machine so the follow-pan
+// pipeline can spread the ~90 ms of PSRAM-bound work over many frames;
+// blocking callers just run the machine to completion. The layer order
+// matches the original renderStatic: field fill, rain, ring metalwork,
+// geography, airports, trail, labels.
+
+// Unit sizes: each is a few milliseconds of work, so the slice runner's
+// deadline overshoot stays small.
+constexpr int kFillRowsPerUnit = 18;
+constexpr int kWxRowsPerUnit = 1;
+constexpr int kGeoLinesPerUnit = 96;
+constexpr int kAirportsPerUnit = 24;
+
+enum class BuildStep : uint8_t {
+  Fill,
+  Weather,
+  Background,
+  GeoBorders,
+  GeoCoast,
+  Airports,
+  Trail,
+  Labels,
+  Done,
+};
+
+struct BuildState {
+  Arduino_GFX* gfx = nullptr;  // Target surface...
+  uint16_t* fb = nullptr;      // ...and its raw framebuffer (row fills).
+  BuildStep step = BuildStep::Done;
+  int row = 0;      // Fill: next panel row.
+  int wxRow = 0;    // Weather: next cell row.
+  int line = 0;     // Geography: next polyline.
+  int airport = 0;  // Airports: next index.
+  Vec center;       // View center latched at buildBegin, with the
+  float bright = 1.0f;  // brightness, for cross-slice consistency.
+};
+BuildState g_build;
+
+// Fills panel rows [y0, y1) with `color` through a tight 32-bit store
+// loop — the fill is pure PSRAM bandwidth, so skip the canvas overhead.
+void fillRows(uint16_t* fb, int y0, int y1, uint16_t color) {
+  uint32_t v2 = (static_cast<uint32_t>(color) << 16) | color;
+  uint32_t* p =
+      reinterpret_cast<uint32_t*>(fb + static_cast<size_t>(y0) * g_w);
+  size_t words = static_cast<size_t>(y1 - y0) * g_w / 2;
+  for (size_t i = 0; i < words; ++i) p[i] = v2;
 }
 
-// Draws every moving element into the live surface, recording each one's box.
-// Order matches the original scene so the composite z-order is unchanged: the
-// sweep sits under the markers, which sit under the aircraft and overlay.
-void drawDynamic(Model& model) {
-  uint32_t onlineAge = millis() - g_onlineSinceMs;
+void buildBegin(Arduino_GFX* gfx, uint16_t* fb, const Model& model) {
+  g_build.gfx = gfx;
+  g_build.fb = fb;
+  g_build.step = BuildStep::Fill;
+  g_build.row = 0;
+  g_build.wxRow = 0;
+  g_build.line = 0;
+  g_build.airport = 0;
+  g_build.center = model.ui.viewCenter;
+  g_build.bright = model.ui.brightness;
+}
 
-  // The sweep only turns once signal is acquired; while offline it is neither
-  // drawn nor tracked, so nothing needs erasing for it next frame. It fades
-  // in over the handoff window when signal has just been acquired.
-  if (model.ui.online) {
-    float fade = onlineAge >= kSweepFadeMs
-                     ? 1.0f
-                     : onlineAge / static_cast<float>(kSweepFadeMs);
-    drawSweep(g_live, model, fade);
-    float sx, sy;
-    polar(model.ui.sweepAngle, kRadius, sx, sy);
-    g_curSweepX = static_cast<int16_t>(sx);
-    g_curSweepY = static_cast<int16_t>(sy);
-    g_curHaveSweep = true;
-  } else {
-    g_curHaveSweep = false;
+// Runs build units until the scene is complete or the budget (µs since
+// `startUs`) is spent; at least one unit always runs, so a contended
+// frame cannot stall the build forever. The latched view center and
+// brightness are swapped in around the units so every slice projects
+// identically, however far the live view has eased since the build
+// began. Returns true once the scene is complete.
+bool buildRun(Model& model, uint32_t startUs, uint32_t budgetUs) {
+  if (g_build.step == BuildStep::Done) return true;
+  Vec liveCenter = model.ui.viewCenter;
+  float liveBright = model.ui.brightness;
+  model.ui.viewCenter = g_build.center;
+  model.ui.brightness = g_build.bright;
+  Arduino_GFX* gfx = g_build.gfx;
+  do {
+    switch (g_build.step) {
+      case BuildStep::Fill: {
+        int to = min(g_build.row + kFillRowsPerUnit, g_h);
+        fillRows(g_build.fb, g_build.row, to, C_BG);
+        g_build.row = to;
+        if (to >= g_h) g_build.step = BuildStep::Weather;
+        break;
+      }
+      case BuildStep::Weather: {
+        if (!(model.ui.online && showWeather(model) &&
+              weatherUsable(model))) {
+          g_build.step = BuildStep::Background;
+          break;
+        }
+        int rows = (g_h + kWxCellPx - 1) / kWxCellPx;
+        int to = min(g_build.wxRow + kWxRowsPerUnit, rows);
+        drawWeatherRows(gfx, model, g_build.wxRow, to);
+        g_build.wxRow = to;
+        if (to >= rows) g_build.step = BuildStep::Background;
+        break;
+      }
+      case BuildStep::Background:
+        drawBackground(gfx, model);
+        g_build.step = BuildStep::GeoBorders;
+        break;
+      case BuildStep::GeoBorders: {
+        if (!model.ui.geography) {
+          g_build.step = BuildStep::Airports;
+          break;
+        }
+        GeoFold f = geoFoldOf(model, geodata::kDegPerUnit);
+        g_build.line = drawGeoSet(
+            gfx, geodata::kBorderPts, geodata::kBorderLen,
+            geodata::kBorderLines, g_build.line, kGeoLinesPerUnit, f.ax,
+            f.bx, f.ay, f.by,
+            dim(C_CYAN, model.ui.brightness * kGeoBorderDim));
+        if (g_build.line >= geodata::kBorderLines) {
+          g_build.line = 0;
+          g_build.step = BuildStep::GeoCoast;
+        }
+        break;
+      }
+      case BuildStep::GeoCoast: {
+        GeoFold f = geoFoldOf(model, geodata::kDegPerUnit);
+        g_build.line = drawGeoSet(
+            gfx, geodata::kCoastPts, geodata::kCoastLen,
+            geodata::kCoastLines, g_build.line, kGeoLinesPerUnit, f.ax,
+            f.bx, f.ay, f.by,
+            dim(C_CYAN, model.ui.brightness * kGeoCoastDim));
+        if (g_build.line >= geodata::kCoastLines) {
+          g_build.step = BuildStep::Airports;
+        }
+        break;
+      }
+      case BuildStep::Airports: {
+        // Airports ride the flights layer (they hide in weather-only
+        // mode, like the traffic and POIs), independent of Geography.
+        if (!showFlights(model)) {
+          g_build.step = BuildStep::Trail;
+          break;
+        }
+        int next =
+            drawAirports(gfx, model, g_build.airport, kAirportsPerUnit);
+        if (next == g_build.airport || next >= airportdata::kCount) {
+          g_build.step = BuildStep::Trail;
+        }
+        g_build.airport = next;
+        break;
+      }
+      case BuildStep::Trail:
+        if (model.ui.following) drawFollowTrail(gfx, model);
+        g_build.step = BuildStep::Labels;
+        break;
+      case BuildStep::Labels:
+        drawHomeName(gfx, model);
+        drawRangeReadout(gfx, model);
+        g_build.step = BuildStep::Done;
+        break;
+      case BuildStep::Done:
+        break;
+    }
+  } while (g_build.step != BuildStep::Done &&
+           micros() - startUs < budgetUs);
+  model.ui.viewCenter = liveCenter;
+  model.ui.brightness = liveBright;
+  return g_build.step == BuildStep::Done;
+}
+
+// Paints the whole static scene into the ACTIVE reference, blocking.
+// Boot, the power-on bloom and the urgent rebuild path use this; view
+// drift while following goes through the sliced pipeline instead.
+void renderStatic(Model& model) {
+  buildBegin(g_static, g_staticFb, model);
+  buildRun(model, micros(), UINT32_MAX);
+}
+
+// ---- Follow-pan pipeline: rebuilding without a blocking frame. ----
+//
+// Following a flight moves the view about a pixel a second, and every
+// pixel of drift used to trigger the blocking rebuild-and-repaint — a
+// ~250 ms freeze, once a second, squarely while the user is watching
+// their flight. Instead, gradual drifts of the static signature are
+// absorbed here: the new scene is painted into a spare reference
+// buffer a time-budgeted slice per frame (Build), the spare is swapped
+// in to become the active reference, and the two scan framebuffers
+// then converge on it a band of rows per frame (Repaint). No frame
+// blocks. While a framebuffer still shows rows of the previous scene,
+// erases restore from the new one — a transient, pixel-scale mismatch
+// that the row sweep repaints within a few frames.
+//
+// Discrete, user-visible switches (range, mode, geography, home,
+// online) keep the blocking rebuild: they should land instantly, and a
+// single hitch on a deliberate control input reads as response, not
+// stutter.
+
+enum class Pipe : uint8_t { Idle, Build, Repaint };
+Pipe g_pipe = Pipe::Idle;
+StaticSig g_pipeSig;             // Signature the in-flight build satisfies.
+Arduino_GFX* g_spare = nullptr;  // Spare reference surface...
+uint16_t* g_spareFb = nullptr;   // ...and its framebuffer.
+
+// Per-frame time budgets, measured from the start of the frame. The
+// panel scans a frame every ~40.6 ms; pipeline work stops at its
+// deadline so the frame still makes the boundary. Repaint bands run
+// before the dynamic pass and reserve room for it (a band also forces
+// the elements it crosses to repaint, so a modest band spreads that
+// load); build slices run after it and take whatever is left.
+constexpr uint32_t kRepaintDeadlineUs = 12000;
+constexpr uint32_t kFrameBudgetUs = 34000;
+constexpr int kRepaintChunkRows = 16;
+
+// Successive pipeline starts are spaced out: the drifting signature
+// changes two or three times a second (view x, view y and the trail
+// tick over independently), and each pass costs two band sweeps of
+// repaint. One pass per second coalesces them — the same cadence the
+// old blocking rebuild had, minus the stall.
+constexpr uint32_t kPipeMinIntervalMs = 1000;
+uint32_t g_lastPipeStartMs = 0;
+
+// Contention awareness: while the network core's traffic poll is
+// running, every PSRAM access here slows by a third, and frames that
+// would fit the panel period start missing it. Pipeline work (bands and
+// slices) yields on frames whose predecessor missed its boundary — the
+// pipeline can pause at any point, and the only cost is the map briefly
+// lagging the pan a little further before converging. Every third frame
+// runs the pipeline regardless, so a long stretch of late frames (a
+// poll in a packed sky) slows the map's tracking instead of freezing
+// it.
+constexpr uint32_t kFrameLateUs = 60000;  // ~1.5 panel periods.
+uint32_t g_prevFrameStartUs = 0;
+bool g_prevFrameLate = false;
+uint32_t g_frameCount = 0;
+
+bool pipeYield() { return g_prevFrameLate && g_frameCount % 3 != 0; }
+
+// True when a signature change needs the blocking rebuild (a discrete
+// switch), false for the gradual drifts the pipeline absorbs (view
+// center, ambient brightness, readout emphasis, weather generation,
+// trail growth).
+bool sigUrgent(const StaticSig& a, const StaticSig& b) {
+  return a.range100 != b.range100 || a.mode != b.mode || a.geo != b.geo ||
+         a.online != b.online || a.home != b.home;
+}
+
+// Abandons in-flight pipeline work: the spare's half-painted scene is
+// scratch, and the blocking caller re-syncs both framebuffers itself.
+void pipeCancel() { g_pipe = Pipe::Idle; }
+
+// ---- Change-driven redraw of the moving elements. ----
+
+// One entry of the frame's desired-element list, in draw (z) order:
+// the sweep sits under the markers, which sit under the aircraft and
+// the overlays, exactly as the original full-redraw pass drew them.
+enum class EKind : uint8_t { Home, Poi, Aircraft, Flash, Signal };
+
+struct Desired {
+  uint32_t id;    // Stable identity, ascending in list order.
+  uint32_t key;   // Fingerprint of the drawn pixels.
+  EKind kind;
+  int16_t index;  // Model index for Poi/Aircraft.
+  int16_t old;    // Index into the framebuffer's previous elements.
+  bool redraw;
+};
+
+std::vector<Desired> g_desired;
+std::vector<Elem> g_newElems;
+std::vector<Rect> g_eraseRects;  // Regions restored to static this frame.
+std::vector<Seg> g_eraseSegs;
+uint32_t g_seq = 0;  // Per-frame sequence for always-redraw keys.
+
+uint32_t mix(uint32_t h, uint32_t v) {
+  h ^= v + 0x9e3779b9u + (h << 6) + (h >> 2);
+  return h;
+}
+uint32_t mixf(uint32_t h, float v) {
+  union {
+    float f;
+    uint32_t u;
+  } c;
+  c.f = v;
+  return mix(h, c.u);
+}
+uint32_t hashStr(const String& s) {
+  uint32_t h = 2166136261u;
+  for (unsigned i = 0; i < s.length(); ++i) {
+    h = (h ^ static_cast<uint8_t>(s[i])) * 16777619u;
+  }
+  return h;
+}
+
+// Fingerprints one aircraft's drawn state; false when it draws nothing
+// this frame. Mirrors drawAircraft: every model input that can change a
+// drawn pixel feeds the key, quantized exactly as the draw quantizes.
+bool aircraftDesire(const Model& model, const Aircraft& ac, int index,
+                    uint32_t& key) {
+  bool followed = model.ui.following && index == model.ui.followIndex;
+  bool selected = !model.ui.following && index == model.ui.browseSel;
+  bool candidate = model.ui.following && index == model.ui.candidate;
+  const Vec& at = followed ? ac.est : ac.shown;
+  if (!followed && !ac.seen) return false;
+
+  uint32_t flags = (followed ? 1u : 0) | (selected ? 2u : 0) |
+                   (candidate ? 4u : 0) | (ac.special ? 8u : 0);
+  int brightStep = static_cast<int>(model.ui.brightness * 16.0f);
+  float distance = distanceFrom(model, at);
+  uint32_t h = 2166136261u;
+  if (distance > model.ui.range) {
+    if (!(ac.special || selected || candidate || followed)) return false;
+    // Edge arrow: the rim position from the (quantized) bearing, the
+    // label from the whole-NM distance and callsign.
+    h = mix(h, 1);
+    h = mix(h, flags);
+    h = mix(h, static_cast<uint32_t>(
+                   lroundf(bearingFrom(model, at) * 4.0f)));
+    h = mix(h, static_cast<uint32_t>(static_cast<int>(distance)));
+    h = mix(h, static_cast<uint32_t>(brightStep));
+    h = mix(h, hashStr(ac.callsign));
+    key = h;
+    return true;
   }
 
-  g_live->beginTrack();
-  drawHomeMarker(g_live, model);
-  endTrackPush();
+  float track = followed ? ac.track : ac.shownTrack;
+  float speed = followed ? ac.groundSpeed : ac.shownSpeed;
+  int32_t altitude = followed ? ac.altitude : ac.shownAlt;
+  float x, y;
+  project(model, at, x, y);
+  float ahead = speed / 60.0f;
+  Vec tip{at.x + sinf(track * DEG_TO_RAD) * ahead,
+          at.y + cosf(track * DEG_TO_RAD) * ahead};
+  float tx, ty;
+  project(model, tip, tx, ty);
+  bool labels = model.ui.range <= kLabelMaxRangeNm || followed ||
+                selected || candidate || ac.special;
+  h = mix(h, 2);
+  h = mix(h, flags);
+  h = mix(h, static_cast<uint32_t>(static_cast<int32_t>(floorf(x))));
+  h = mix(h, static_cast<uint32_t>(static_cast<int32_t>(floorf(y))));
+  h = mix(h, static_cast<uint32_t>(static_cast<int32_t>(floorf(tx))));
+  h = mix(h, static_cast<uint32_t>(static_cast<int32_t>(floorf(ty))));
+  h = mixf(h, track);
+  h = mix(h, static_cast<uint32_t>(followed ? 999 : fadeStepOf(ac)));
+  h = mix(h, static_cast<uint32_t>(brightStep));
+  h = mix(h, labels ? 1u : 0u);
+  if (labels) {
+    h = mix(h, hashStr(ac.callsign));
+    h = mix(h, static_cast<uint32_t>(altitude));
+    h = mix(h, static_cast<uint32_t>(static_cast<int>(speed)));
+  }
+  key = h;
+  return true;
+}
+
+// Builds the frame's desired-element list. Ids ascend in list order, so
+// the erase pass can diff against a framebuffer's previous elements in
+// one merge walk.
+void computeDesired(const Model& model) {
+  g_desired.clear();
+  int brightStep = static_cast<int>(model.ui.brightness * 16.0f);
+  uint32_t now = millis();
+  uint32_t onlineAge = now - g_onlineSinceMs;
+
+  {
+    float x, y;
+    project(model, Vec{0, 0}, x, y);
+    uint32_t h = mix(2166136261u,
+                     static_cast<uint32_t>(static_cast<int32_t>(floorf(x))));
+    h = mix(h, static_cast<uint32_t>(static_cast<int32_t>(floorf(y))));
+    h = mix(h, static_cast<uint32_t>(brightStep));
+    g_desired.push_back(Desired{0x08000000u, h, EKind::Home, 0, -1, false});
+  }
 
   if (showFlights(model)) {
-    for (const auto& poi : model.pois) {
+    for (int i = 0; i < static_cast<int>(model.pois.size()); ++i) {
+      const model::Poi& poi = model.pois[i];
       if (distanceFrom(model, poi.pos) > model.ui.range) continue;
-      g_live->beginTrack();
-      drawPoi(g_live, model, poi);
-      endTrackPush();
+      float x, y;
+      project(model, poi.pos, x, y);
+      uint32_t h = mix(2166136261u,
+                       static_cast<uint32_t>(static_cast<int32_t>(floorf(x))));
+      h = mix(h, static_cast<uint32_t>(static_cast<int32_t>(floorf(y))));
+      h = mix(h, static_cast<uint32_t>(brightStep));
+      h = mix(h, hashStr(poi.name));  // A web edit can rename in place.
+      g_desired.push_back(Desired{0x10000000u + i, h, EKind::Poi,
+                                  static_cast<int16_t>(i), -1, false});
     }
     for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
-      drawAircraft(g_live, model, model.aircraft[i], i);  // Tracks itself.
+      uint32_t key;
+      if (aircraftDesire(model, model.aircraft[i], i, key)) {
+        g_desired.push_back(Desired{0x20000000u + i, key, EKind::Aircraft,
+                                    static_cast<int16_t>(i), -1, false});
+      }
     }
   }
 
   // Toggle feedback flashes on the live scope; offline, the input-test
   // line inside drawAcquiringSignal already covers every control event.
-  if (model.ui.online) {
-    g_live->beginTrack();
-    drawToggleFlash(g_live, model);
-    endTrackPush();
+  if (model.ui.online && !model.ui.lastInput.isEmpty() &&
+      now - model.ui.lastInputMs < 2500) {
+    uint32_t h = mix(hashStr(model.ui.lastInput),
+                     (now - model.ui.lastInputMs) / 80);
+    h = mix(h, static_cast<uint32_t>(brightStep));
+    g_desired.push_back(Desired{0x30000001u, h, EKind::Flash, 0, -1, false});
   }
 
-  if (!model.ui.online) {
-    g_live->beginTrack();
-    drawAcquiringSignal(g_live, model, 1.0f);
-    endTrackPush();
-  } else if (onlineAge < kSignalFadeMs) {
-    // Signal was just acquired: dissolve the title into the live scope.
-    g_live->beginTrack();
-    drawAcquiringSignal(g_live, model,
-                        1.0f - onlineAge / static_cast<float>(kSignalFadeMs));
-    endTrackPush();
+  // The acquiring-signal title pulses while offline and dissolves just
+  // after signal is acquired; it repaints every frame either way.
+  if (!model.ui.online || onlineAge < kSignalFadeMs) {
+    g_desired.push_back(
+        Desired{0x30000002u, ++g_seq, EKind::Signal, 0, -1, false});
   }
+}
+
+// Draws one desired element into the live surface and captures its
+// erase bookkeeping (at most one box and one line segment each).
+void drawElem(Model& model, const Desired& d, Elem& out) {
+  g_curRects.clear();
+  g_curSegs.clear();
+  switch (d.kind) {
+    case EKind::Home:
+      g_live->beginTrack();
+      drawHomeMarker(g_live, model);
+      endTrackPush();
+      break;
+    case EKind::Poi:
+      g_live->beginTrack();
+      drawPoi(g_live, model, model.pois[d.index]);
+      endTrackPush();
+      break;
+    case EKind::Aircraft:
+      drawAircraft(g_live, model, model.aircraft[d.index], d.index);
+      break;
+    case EKind::Flash:
+      g_live->beginTrack();
+      drawToggleFlash(g_live, model);
+      endTrackPush();
+      break;
+    case EKind::Signal: {
+      uint32_t onlineAge = millis() - g_onlineSinceMs;
+      float fade =
+          model.ui.online
+              ? 1.0f - onlineAge / static_cast<float>(kSignalFadeMs)
+              : 1.0f;
+      if (fade > 0.0f) {
+        g_live->beginTrack();
+        drawAcquiringSignal(g_live, model, fade);
+        endTrackPush();
+      }
+      break;
+    }
+  }
+  out.id = d.id;
+  out.key = d.key;
+  out.hasRect = !g_curRects.empty();
+  if (out.hasRect) out.rect = g_curRects[0];
+  out.hasRect2 = g_curRects.size() > 1;
+  if (out.hasRect2) {
+    Rect r = g_curRects[1];
+    for (size_t i = 2; i < g_curRects.size(); ++i) {  // Union, for safety.
+      const Rect& b = g_curRects[i];
+      int16_t x1 = max(static_cast<int16_t>(r.x + r.w),
+                       static_cast<int16_t>(b.x + b.w));
+      int16_t y1 = max(static_cast<int16_t>(r.y + r.h),
+                       static_cast<int16_t>(b.y + b.h));
+      r.x = min(r.x, b.x);
+      r.y = min(r.y, b.y);
+      r.w = x1 - r.x;
+      r.h = y1 - r.y;
+    }
+    out.rect2 = r;
+  }
+  out.hasSeg = !g_curSegs.empty();
+  if (out.hasSeg) out.seg = g_curSegs[0];
+}
+
+// Restores the static pixels under one previous element and records the
+// regions for the disturb check below.
+void eraseElem(const Elem& e) {
+  if (e.hasSeg) {
+    restoreSeg(e.seg.x0, e.seg.y0, e.seg.x1, e.seg.y1);
+    g_eraseSegs.push_back(e.seg);
+  }
+  if (e.hasRect) {
+    restoreRect(e.rect);
+    g_eraseRects.push_back(e.rect);
+  }
+  if (e.hasRect2) {
+    restoreRect(e.rect2);
+    g_eraseRects.push_back(e.rect2);
+  }
+}
+
+// Overlap tests for the disturb check, padded for the 3x3 erase brush.
+constexpr int kDisturbPad = 2;
+
+bool rectsOverlap(const Rect& a, const Rect& b) {
+  return a.x < b.x + b.w + kDisturbPad && b.x < a.x + a.w + kDisturbPad &&
+         a.y < b.y + b.h + kDisturbPad && b.y < a.y + a.h + kDisturbPad;
+}
+
+// Line segment vs box, via the same outcode walk the geography clipper
+// uses; conservative only in the padding.
+bool segRectOverlap(const Seg& s, const Rect& r) {
+  float x0 = s.x0, y0 = s.y0, x1 = s.x1, y1 = s.y1;
+  float lx = r.x - kDisturbPad, rx = r.x + r.w + kDisturbPad;
+  float ty = r.y - kDisturbPad, by = r.y + r.h + kDisturbPad;
+  auto code = [&](float x, float y) {
+    return static_cast<uint8_t>((x < lx ? 1 : 0) | (x > rx ? 2 : 0) |
+                                (y < ty ? 4 : 0) | (y > by ? 8 : 0));
+  };
+  uint8_t c0 = code(x0, y0), c1 = code(x1, y1);
+  for (;;) {
+    if ((c0 | c1) == 0) return true;
+    if (c0 & c1) return false;
+    uint8_t out = c0 != 0 ? c0 : c1;
+    float x, y;
+    if (out & 1) {
+      x = lx;
+      y = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+    } else if (out & 2) {
+      x = rx;
+      y = y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+    } else if (out & 4) {
+      y = ty;
+      x = x0 + (x1 - x0) * (y - y0) / (y1 - y0);
+    } else {
+      y = by;
+      x = x0 + (x1 - x0) * (y - y0) / (y1 - y0);
+    }
+    if (out == c0) {
+      x0 = x;
+      y0 = y;
+      c0 = code(x0, y0);
+    } else {
+      x1 = x;
+      y1 = y;
+      c1 = code(x1, y1);
+    }
+  }
+}
+
+Rect segBox(const Seg& s) {
+  int16_t x = min(s.x0, s.x1), y = min(s.y0, s.y1);
+  return Rect{x, y, static_cast<int16_t>(max(s.x0, s.x1) - x + 1),
+              static_cast<int16_t>(max(s.y0, s.y1) - y + 1)};
+}
+
+// True when something restored this frame (or the freshly drawn sweep)
+// touched this carried element's pixels, so it must repaint even though
+// its own state is unchanged.
+bool disturbed(const Elem& e, const Seg* newSweep) {
+  for (const Rect& r : g_eraseRects) {
+    if (e.hasRect && rectsOverlap(e.rect, r)) return true;
+    if (e.hasRect2 && rectsOverlap(e.rect2, r)) return true;
+    if (e.hasSeg && segRectOverlap(e.seg, r)) return true;
+  }
+  for (const Seg& s : g_eraseSegs) {
+    if (e.hasRect && segRectOverlap(s, e.rect)) return true;
+    if (e.hasRect2 && segRectOverlap(s, e.rect2)) return true;
+    if (e.hasSeg && segRectOverlap(s, segBox(e.seg))) return true;
+  }
+  if (newSweep != nullptr) {
+    if (e.hasRect && segRectOverlap(*newSweep, e.rect)) return true;
+    if (e.hasRect2 && segRectOverlap(*newSweep, e.rect2)) return true;
+    if (e.hasSeg && segRectOverlap(*newSweep, segBox(e.seg))) return true;
+  }
+  return false;
 }
 
 // ---- Incremental power on/off transitions. ----
@@ -1140,10 +1723,10 @@ bool renderBloom(Arduino_GFX* gfx, Model& model, float p) {
     // the moving elements on top. The back buffer still holds boot black
     // and stays dirty, so its first frame repaints it from the reference.
     FbState& front = g_fb[1 - display::backIndex()];
-    front.rects.clear();
-    front.segs.clear();
+    front.elems.clear();
     front.haveSweep = false;
     front.dirty = false;
+    front.repaintRow = static_cast<int16_t>(g_h);  // Matches the reference.
     g_transPhase = -1;
     return true;
   }
@@ -1230,6 +1813,19 @@ void beginRenderer(display::LiveGfx* live, Arduino_GFX* staticRef,
   g_targetFb = display::frontFb();
   g_w = width;
   g_h = height;
+
+  // The follow-pan pipeline's spare reference: a third full-panel
+  // buffer in PSRAM. If it cannot be allocated, the pipeline stays off
+  // and every rebuild takes the blocking path.
+  if (g_spareFb == nullptr) {
+    g_spareFb = static_cast<uint16_t*>(heap_caps_aligned_alloc(
+        16, static_cast<size_t>(width) * height * 2, MALLOC_CAP_SPIRAM));
+    if (g_spareFb != nullptr) {
+      g_spare = new display::StaticGfx(width, height, g_spareFb);
+    } else {
+      Serial.println("[radar] spare reference alloc failed; pipeline off.");
+    }
+  }
   invalidate();
 }
 
@@ -1238,33 +1834,51 @@ void invalidate() {
   for (FbState& fb : g_fb) {
     fb.dirty = true;
     fb.haveSweep = false;
-    fb.rects.clear();
-    fb.segs.clear();
+    fb.elems.clear();
   }
 }
 
 void renderIncremental(Model& model) {
+  uint32_t frameStartUs = micros();
+  if (g_prevFrameStartUs != 0) {
+    g_prevFrameLate = frameStartUs - g_prevFrameStartUs > kFrameLateUs;
+  }
+  g_prevFrameStartUs = frameStartUs;
+  ++g_frameCount;
+
   // Track the offline-to-online edge that drives the handoff dissolve
-  // (title fading out, sweep fading in) in drawDynamic.
+  // (title fading out, sweep fading in).
   if (model.ui.online != g_wasOnline) {
     g_wasOnline = model.ui.online;
     if (model.ui.online) g_onlineSinceMs = millis();
   }
 
-  // Rebuild the static reference when the view, range, mode, geography,
-  // home or brightness changed; that marks both framebuffers for a full
-  // repaint from it. Rate-limited (see kRebuildMinIntervalMs): a pending
-  // change is picked up here on a later frame once the interval allows.
+  // React to static-scene changes. Discrete switches take the blocking
+  // rebuild-and-repaint (rate-limited, see kRebuildMinIntervalMs);
+  // gradual drifts start the sliced pipeline, and whatever drifts
+  // further while it runs is picked up by the next one.
   StaticSig sig = staticSigOf(model);
   if (g_needStatic || !sigEqual(sig, g_sig)) {
-    uint32_t now = millis();
-    if (g_needStatic || now - g_lastRebuildMs >= kRebuildMinIntervalMs) {
-      renderStatic(model);
-      g_sig = sig;
-      g_needStatic = false;
-      g_lastRebuildMs = now;
-      g_fb[0].dirty = true;
-      g_fb[1].dirty = true;
+    bool urgent =
+        g_needStatic || sigUrgent(sig, g_sig) || g_spareFb == nullptr;
+    if (urgent) {
+      uint32_t now = millis();
+      if (g_needStatic || now - g_lastRebuildMs >= kRebuildMinIntervalMs) {
+        pipeCancel();
+        renderStatic(model);
+        g_sig = sig;
+        g_needStatic = false;
+        g_lastRebuildMs = now;
+        g_fb[0].dirty = true;
+        g_fb[1].dirty = true;
+      }
+    } else if (g_pipe == Pipe::Idle &&
+               millis() - g_lastPipeStartMs >= kPipeMinIntervalMs) {
+      // Latch the drifted scene and start building it into the spare.
+      g_pipeSig = sig;
+      buildBegin(g_spare, g_spareFb, model);
+      g_pipe = Pipe::Build;
+      g_lastPipeStartMs = millis();
     }
   }
 
@@ -1273,32 +1887,154 @@ void renderIncremental(Model& model) {
   FbState& fb = g_fb[display::backIndex()];
   bindTarget(display::backFb());
 
+  Rect band{0, 0, 0, 0};
+  bool haveBand = false;
+
   if (fb.dirty) {
     restoreAll();  // Repaint the whole buffer from the reference.
-    fb.rects.clear();
-    fb.segs.clear();
+    fb.elems.clear();
     fb.haveSweep = false;
     fb.dirty = false;
-  } else {
-    // Erase everything this buffer showed when it was last drawn (two
-    // frames ago), then redraw at the new positions below.
-    if (fb.haveSweep) {
-      restoreSeg(static_cast<int>(kCenterX), static_cast<int>(kCenterY),
-                 fb.sweepX, fb.sweepY);
+    fb.repaintRow = static_cast<int16_t>(g_h);  // Fully in sync now.
+  } else if (g_pipe == Pipe::Repaint && fb.repaintRow < g_h &&
+             !pipeYield()) {
+    // Progressive repaint: converge this buffer on the freshly swapped
+    // reference a chunk of rows at a time, stopping at the deadline
+    // (at least one chunk per frame, so a stretch of late frames slows
+    // the convergence instead of stalling it).
+    int from = fb.repaintRow;
+    int row = from;
+    while (row < g_h) {
+      int to = min(row + kRepaintChunkRows, g_h);
+      restoreRect(Rect{0, static_cast<int16_t>(row),
+                       static_cast<int16_t>(g_w),
+                       static_cast<int16_t>(to - row)});
+      row = to;
+      if (micros() - frameStartUs >= kRepaintDeadlineUs) break;
     }
-    for (const auto& s : fb.segs) restoreSeg(s.x0, s.y0, s.x1, s.y1);
-    for (const auto& r : fb.rects) restoreRect(r);
+    fb.repaintRow = static_cast<int16_t>(row);
+    band = Rect{0, static_cast<int16_t>(from), static_cast<int16_t>(g_w),
+                static_cast<int16_t>(row - from)};
+    haveBand = true;
   }
 
-  g_curRects.clear();
-  g_curSegs.clear();
-  drawDynamic(model);
+  // The pipeline is done once both buffers have converged on the
+  // swapped-in reference.
+  if (g_pipe == Pipe::Repaint && g_fb[0].repaintRow >= g_h &&
+      g_fb[1].repaintRow >= g_h) {
+    g_pipe = Pipe::Idle;
+  }
 
-  fb.rects.swap(g_curRects);
-  fb.segs.swap(g_curSegs);
+  computeDesired(model);
+
+  // The sweep this frame will draw, for the disturb check: elements it
+  // crosses repaint, keeping the blips-over-sweep z-order.
+  Seg newSweep{0, 0, 0, 0};
+  bool haveNewSweep = false;
+  if (model.ui.online) {
+    float sx, sy;
+    polar(model.ui.sweepAngle, kRadius, sx, sy);
+    newSweep =
+        Seg{static_cast<int16_t>(kCenterX), static_cast<int16_t>(kCenterY),
+            static_cast<int16_t>(sx), static_cast<int16_t>(sy)};
+    haveNewSweep = true;
+  }
+
+  // Erase pass: restore the old sweep, then walk this buffer's previous
+  // elements against the desired list (both ascend by id). An element
+  // that is gone or whose fingerprint changed is erased; the rest are
+  // candidates to carry. Every erase lands before any redraw, which
+  // keeps overlaps correct.
+  g_eraseRects.clear();
+  g_eraseSegs.clear();
+  if (haveBand && band.h > 0) g_eraseRects.push_back(band);
+  if (fb.haveSweep) {
+    restoreSeg(static_cast<int>(kCenterX), static_cast<int>(kCenterY),
+               fb.sweepX, fb.sweepY);
+    g_eraseSegs.push_back(Seg{static_cast<int16_t>(kCenterX),
+                              static_cast<int16_t>(kCenterY), fb.sweepX,
+                              fb.sweepY});
+  }
+  size_t oi = 0;
+  for (Desired& d : g_desired) {
+    while (oi < fb.elems.size() && fb.elems[oi].id < d.id) {
+      eraseElem(fb.elems[oi]);  // Gone this frame.
+      ++oi;
+    }
+    if (oi < fb.elems.size() && fb.elems[oi].id == d.id) {
+      if (fb.elems[oi].key != d.key) {
+        eraseElem(fb.elems[oi]);
+        d.redraw = true;
+      } else {
+        d.old = static_cast<int16_t>(oi);
+      }
+      ++oi;
+    } else {
+      d.redraw = true;  // New this frame.
+    }
+  }
+  while (oi < fb.elems.size()) {
+    eraseElem(fb.elems[oi]);  // Gone this frame.
+    ++oi;
+  }
+
+  // Disturb pass: a carried element whose pixels anything touched —
+  // an erased region, the repaint band, or the new sweep — repaints
+  // (with identical pixels, so nothing visibly changes).
+  for (Desired& d : g_desired) {
+    if (d.redraw || d.old < 0) continue;
+    if (disturbed(fb.elems[d.old], haveNewSweep ? &newSweep : nullptr)) {
+      d.redraw = true;
+    }
+  }
+
+  // Draw pass: the sweep first (under everything), then the changed
+  // elements in z order; unchanged elements keep their pixels and carry
+  // their bookkeeping forward.
+  uint32_t onlineAge = millis() - g_onlineSinceMs;
+  if (model.ui.online) {
+    // The sweep only turns once signal is acquired, fading in over the
+    // handoff window; offline it is neither drawn nor tracked.
+    float fade = onlineAge >= kSweepFadeMs
+                     ? 1.0f
+                     : onlineAge / static_cast<float>(kSweepFadeMs);
+    drawSweep(g_live, model, fade);
+    g_curSweepX = newSweep.x1;
+    g_curSweepY = newSweep.y1;
+    g_curHaveSweep = true;
+  } else {
+    g_curHaveSweep = false;
+  }
+
+  g_newElems.clear();
+  for (const Desired& d : g_desired) {
+    Elem e;
+    if (d.redraw) {
+      drawElem(model, d, e);
+    } else {
+      e = fb.elems[d.old];
+    }
+    g_newElems.push_back(e);
+  }
+  fb.elems.swap(g_newElems);
   fb.sweepX = g_curSweepX;
   fb.sweepY = g_curSweepY;
   fb.haveSweep = g_curHaveSweep;
+
+  // Build slices: spend whatever remains of the frame budget painting
+  // the pipeline's spare reference (off-screen, so only time matters).
+  if (g_pipe == Pipe::Build && !pipeYield()) {
+    if (buildRun(model, frameStartUs, kFrameBudgetUs)) {
+      // The spare now holds the drifted scene: make it the active
+      // reference and start converging both framebuffers on it.
+      std::swap(g_static, g_spare);
+      std::swap(g_staticFb, g_spareFb);
+      g_sig = g_pipeSig;
+      g_fb[0].repaintRow = 0;
+      g_fb[1].repaintRow = 0;
+      g_pipe = Pipe::Repaint;
+    }
+  }
 
   display::flip();  // Scan out this frame from the next boundary on.
 }
@@ -1379,6 +2115,9 @@ void step(Model& model, uint32_t dtMs) {
     if (ac.freshness < 0.0f) ac.freshness = 0.0f;
     if (swept(previous, model.ui.sweepAngle, bearingFrom(model, ac.pos))) {
       ac.shown = ac.pos;
+      ac.shownTrack = ac.track;
+      ac.shownSpeed = ac.groundSpeed;
+      ac.shownAlt = ac.altitude;
       ac.seen = true;
       ac.freshness = 1.0f;
     }

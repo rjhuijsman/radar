@@ -29,8 +29,15 @@ struct Aircraft {
   uint16_t color = 0;     // Feed color (special flights); 0 = default amber.
 
   // Sweep-refresh bookkeeping: `shown` is the last position the sweep
-  // painted; the blip is drawn there until the sweep passes again.
+  // painted; the blip is drawn there until the sweep passes again. The
+  // track/speed/altitude snapshots freeze the leading line and the data
+  // block the same way, so a fresh poll cannot swing every direction
+  // vector (or tick every label) ahead of the sweep. The followed
+  // flight draws from the live fields instead.
   Vec shown;
+  float shownTrack = 0;
+  float shownSpeed = 0;
+  int32_t shownAlt = 0;
   bool seen = false;
   float freshness = 0;  // 1 just after a sweep pass, decays toward 0.
 
