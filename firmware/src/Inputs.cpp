@@ -25,6 +25,7 @@ bool g_lightOk = false;
 bool g_buttonDown = false;
 bool g_turnedWhileDown = false;  // A turn during a hold means "zoom", not "click".
 bool g_lastSleep = false;
+bool g_togglesInit = false;  // First readToggles adopts switch state silently.
 uint32_t g_lastLightMs = 0;
 uint32_t g_lastBrowseMs = 0;  // Last browse turn, for the selection timeout.
 
@@ -159,17 +160,29 @@ void press(Model& model) {
 
 void readToggles(Model& model) {
   // 2-position Display toggle: closed (LOW) selects Flights, open (HIGH)
-  // selects Weather. Note only on an actual change, so it does not spam the
-  // poll.
+  // selects Weather. Geography toggle: open (HIGH) = on.
   DisplayMode display = digitalRead(config::PIN_DISPLAY) == LOW
                             ? DisplayMode::Flights
                             : DisplayMode::Weather;
+  bool geo = digitalRead(config::PIN_GEO) == HIGH;
+
+  if (!g_togglesInit) {
+    // First poll after boot: adopt the physical switch positions silently, so
+    // a switch already set differently from the model defaults does not flash
+    // a spurious mode message on startup.
+    g_togglesInit = true;
+    model.ui.display = display;
+    model.ui.geography = geo;
+    return;
+  }
+
+  // Note only on an actual change, so it does not spam the poll.
   if (display != model.ui.display) {
     model.ui.display = display;
     if (display == DisplayMode::Weather && model.ui.following) {
-      // Weather pauses tracking: remember the flight and let the map settle
-      // home-static. Returning to flights resumes it (unless the user goes
-      // home in the meantime, which clears pausedFollow).
+      // Weather pauses tracking: remember the flight and let the map freeze
+      // in place. Returning to flights resumes it (unless the user goes home
+      // in the meantime, which clears pausedFollow).
       String cs;
       if (model.ui.followIndex >= 0 &&
           model.ui.followIndex < static_cast<int>(model.aircraft.size())) {
@@ -185,7 +198,6 @@ void readToggles(Model& model) {
                                                      : "DISPLAY: FLIGHTS");
   }
 
-  bool geo = digitalRead(config::PIN_GEO) == HIGH;
   if (geo != model.ui.geography) {
     model.ui.geography = geo;
     noteInput(model, geo ? "GEOGRAPHY: ON" : "GEOGRAPHY: OFF");
