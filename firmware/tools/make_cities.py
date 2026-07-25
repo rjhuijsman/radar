@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+"""Builds src/cities.h from GeoNames data.
+
+Fetches the GeoNames cities15000 table (CC-BY, every city of 15000+
+people worldwide), keeps the largest population centers on the
+planet, collapses near-duplicate entries (a metro's enclaves and
+twin listings) into their most populous member, and emits the result
+as a compact const array in a C header the firmware compiles into
+flash.
+
+Positions are quantized to 1/180 degree fixed point — coarser than
+geo_data.h's 1/400, because a global longitude times 400 overflows
+int16 while times 180 just fits (180 * 180 = 32400 < 32767); the
+half-unit error is ~0.15 NM, invisible under a city marker. The
+array is sorted by population, largest first, so the renderer can
+scan from the top and stop after the first N entries that project
+into view — the top-N-in-view selection falls out of the ordering.
+
+Run from anywhere; it writes firmware/src/cities.h next to this
+script's parent. The download is cached in the system temp dir so
+re-runs are instant.
+
+The default depth of 800 is set by the smallest market that has to
+work: a home in the Dutch countryside needs Amsterdam (world rank
+~713 by city-proper population) on its scope, so 500 giants are not
+enough. 800 keeps the header ~16 KB.
+
+  ./make_cities.py [--top 800] [--min-pop 0] [--scale 180]
+"""
+
+import argparse
+import io
+import math
+import os
+import sys
+import tempfile
+import urllib.request
+import zipfile
+
+URL = "https://download.geonames.org/export/dump/cities15000.zip"
+
+# Two entries closer together than this are one city: a metro's
+# enclaves and twin listings (Howrah beside Kolkata) collapse into
+# the most populous member, so each blob on the scope is one marker.
+DEDUPE_KM = 8.0
+
+# Labels are drawn in the 6-px GFX font; capping the name keeps the
+# widest label under ~100 px on the scope.
+NAME_MAX = 16
+
+
+def clip(name):
+    """Caps a name at NAME_MAX, preferring a word boundary.
+
+    A hard cut mid-word ("HO CHI MINH CI") reads as a bug on the
+    scope; retreating to the last space ("SANTIAGO DE LOS
+    CABALLEROS" -> "SANTIAGO DE") and then shedding a dangling short
+    particle ("SANTIAGO") keeps the label a real name. The hard cut
+    remains the fallback for a single long word.
+    """
+    if len(name) <= NAME_MAX:
+        return name
+    cut = name[:NAME_MAX].rstrip()
+    if " " in cut:
+        cut = cut[:cut.rfind(" ")]
+        while " " in cut and len(cut.rsplit(" ", 1)[1]) <= 3:
+            cut = cut[:cut.rfind(" ")]
+    return cut
+
+
+def fetch(cache_dir):
+    path = os.path.join(cache_dir, "cities15000.zip")
+    if not os.path.exists(path):
+        print(f"fetching {URL}")
+        with urllib.request.urlopen(URL) as response:
+            data = response.read()
+        with open(path, "wb") as f:
+            f.write(data)
+    with zipfile.ZipFile(path) as zf:
+        with zf.open("cities15000.txt") as f:
+            return io.TextIOWrapper(f, encoding="utf-8").readlines()
+
+
+def parse(lines, min_pop):
+    """Returns (population, name, lat, lon) tuples worth considering.
+
+    GeoNames columns (tab-separated): 1 name, 2 asciiname, 4 lat,
+    5 lon, 7 feature code, 14 population. PPLX rows are sections of
+    a city (Brooklyn and its kin) — dropped, or they would flood
+    their own metro with duplicate markers.
+    """
+    cities = []
+    for line in lines:
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) < 15 or cols[7] == "PPLX":
+            continue
+        try:
+            lat, lon = float(cols[4]), float(cols[5])
+            population = int(cols[14])
+        except ValueError:
+            continue
+        if population < max(min_pop, 1):
+            continue
+        name = clip(cols[2].upper().strip())
+        if not name:
+            continue
+        cities.append((population, name, lat, lon))
+    return cities
+
+
+def dedupe(cities):
+    """Collapses near-duplicates, keeping the most populous member.
+
+    The list arrives sorted by population descending, so a greedy
+    keep-unless-close pass keeps exactly the biggest entry of each
+    cluster. The distance check is a flat-earth approximation — fine
+    at 8 km.
+    """
+    kept = []
+    for population, name, lat, lon in cities:
+        close = False
+        for _, _, klat, klon in kept:
+            dy = (lat - klat) * 111.0
+            dx = (lon - klon) * 111.0 * math.cos(math.radians(lat))
+            if dx * dx + dy * dy < DEDUPE_KM * DEDUPE_KM:
+                close = True
+                break
+        if not close:
+            kept.append((population, name, lat, lon))
+    return kept
+
+
+def emit(path, cities, scale):
+    lines = []
+    for population, name, lat, lon in cities:
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        lines.append(f'    {{{round(lat * scale)}, {round(lon * scale)}, '
+                     f'{population}, "{escaped}"}},\n')
+
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"""\
+// Generated by tools/make_cities.py — do not edit by hand.
+//
+// The world's {len(cities)} largest population centers from GeoNames
+// cities15000 (CC-BY), near-duplicates within {DEDUPE_KM:g} km collapsed,
+// positions quantized to 1/{scale:g} degree fixed point (coarser than
+// geo_data.h's 1/400: a global longitude times 400 overflows int16).
+// Sorted by population, largest first, so a scan from the top meets
+// the biggest cities first and the renderer's stop-after-N-in-view
+// pass needs no sorting of its own. The array is const, so it lives
+// in flash (memory-mapped on the ESP32-S3), not RAM.
+
+#pragma once
+
+#include <stdint.h>
+
+namespace citydata {{
+
+// Degrees per fixed-point unit: lat = kCities[i].lat * kDegPerUnit.
+constexpr float kDegPerUnit = {1.0 / scale!r}f;
+
+struct City {{
+  int16_t lat;          // Fixed-point 1/{scale:g} degree.
+  int16_t lon;
+  uint32_t population;  // GeoNames population figure.
+  const char* name;     // Uppercase ASCII, NUL terminated.
+}};
+
+// Sorted by population, largest first.
+constexpr int kCount = {len(cities)};
+
+constexpr City kCities[] = {{
+""")
+        f.writelines(lines)
+        f.write("};\n\n}  // namespace citydata\n")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--top", type=int, default=800,
+                        help="number of cities to keep, largest first")
+    parser.add_argument("--min-pop", type=int, default=0,
+                        help="drop cities below this population")
+    parser.add_argument("--scale", type=float, default=180.0,
+                        help="fixed-point units per degree")
+    args = parser.parse_args()
+
+    cache_dir = os.path.join(tempfile.gettempdir(), "geonames-cache")
+    os.makedirs(cache_dir, exist_ok=True)
+
+    cities = parse(fetch(cache_dir), args.min_pop)
+    cities.sort(key=lambda c: (-c[0], c[1]))
+    cities = dedupe(cities)[:args.top]
+
+    out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "..", "src", "cities.h")
+    emit(out_path, cities, args.scale)
+
+    # sizeof(City) is 12 (2+2+4+4 on the 32-bit ESP32-S3), plus each
+    # name's NUL-terminated string.
+    flash = sum(12 + len(name) + 1 for _, name, _, _ in cities)
+    print(f"cities:   {len(cities)} (smallest kept: "
+          f"{cities[-1][0]} — {cities[-1][1]})")
+    print(f"total:    ~{flash / 1024:.1f} KB flash -> {out_path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

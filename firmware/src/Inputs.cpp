@@ -176,11 +176,11 @@ void press(Model& model) {
 
 void readToggles(Model& model) {
   // 2-position Display toggle: closed (LOW) selects Flights, open (HIGH)
-  // selects Weather. Geography toggle: open (HIGH) = on.
+  // selects Weather. Cities toggle: open (HIGH) = on.
   DisplayMode display = digitalRead(config::PIN_DISPLAY) == LOW
                             ? DisplayMode::Flights
                             : DisplayMode::Weather;
-  bool geo = digitalRead(config::PIN_GEO) == HIGH;
+  bool cities = digitalRead(config::PIN_CITIES) == HIGH;
 
   if (!g_togglesInit) {
     // First poll after boot: adopt the physical switch positions silently, so
@@ -188,7 +188,7 @@ void readToggles(Model& model) {
     // a spurious mode message on startup.
     g_togglesInit = true;
     model.ui.display = display;
-    model.ui.geography = geo;
+    model.ui.cities = cities;
     return;
   }
 
@@ -214,9 +214,9 @@ void readToggles(Model& model) {
                                                      : "DISPLAY: FLIGHTS");
   }
 
-  if (geo != model.ui.geography) {
-    model.ui.geography = geo;
-    noteInput(model, geo ? "GEOGRAPHY: ON" : "GEOGRAPHY: OFF");
+  if (cities != model.ui.cities) {
+    model.ui.cities = cities;
+    noteInput(model, cities ? "CITIES: ON" : "CITIES: OFF");
   }
 
   // Sleep (power switch, inverted): OPEN (HIGH) is the OFF position, CLOSED
@@ -282,7 +282,7 @@ void readKnob(Model& model) {
 void begin() {
   pinMode(config::PIN_SLEEP, INPUT_PULLUP);
   pinMode(config::PIN_DISPLAY, INPUT_PULLUP);
-  pinMode(config::PIN_GEO, INPUT_PULLUP);
+  pinMode(config::PIN_CITIES, INPUT_PULLUP);
 
   // display::begin() already ran Wire.begin(SDA=8, SCL=18) before this task
   // starts, so the bus is up. Modulino.begin() calls the no-arg Wire.begin(),

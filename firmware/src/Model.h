@@ -138,7 +138,7 @@ struct Ui {
   float range = 40.0f;         // Current display range in NM.
   float defaultRange = 40.0f;  // Zoom applied at boot and home-to-home switch.
   DisplayMode display = DisplayMode::Flights;
-  bool geography = false;      // Geography overlay on/off.
+  bool cities = false;         // City-markers overlay on/off.
   Screen screen = Screen::On;
 
   bool zoomHold = false;       // Encoder held: turning zooms, not browses.

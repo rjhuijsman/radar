@@ -44,12 +44,12 @@ constexpr uint8_t EXP_TFT_MOSI = 7;
 // contact reads LOW. Sleep is on an RTC-capable pin so it can wake the
 // chip from deep sleep via ext0.
 // Pad labels are the Qualia S3 breakout silkscreen. Display is a single
-// 2-position toggle; Geography sits on the TX0 pad (its brief ROM boot
+// 2-position toggle; Cities sits on the TX0 pad (its brief ROM boot
 // output is harmless, since Serial runs over USB-CDC). This leaves the whole
 // SPI header (SCK5/MISO6/MOSI7/CS15) free for a possible future SD card.
 constexpr int8_t PIN_SLEEP = 17;    // A0 pad, RTC-capable (deep-sleep wake).
 constexpr int8_t PIN_DISPLAY = 16;  // A1 pad, 2-position Flights/Weather toggle.
-constexpr int8_t PIN_GEO = 43;      // TX0 pad, geography overlay on/off.
+constexpr int8_t PIN_CITIES = 43;   // TX0 pad, city-markers overlay on/off.
 
 // ---- I2C bus (STEMMA QT). Shared by the expander, encoder and sensor. ----
 constexpr int8_t I2C_SDA = 8;
