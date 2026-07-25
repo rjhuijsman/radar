@@ -79,7 +79,7 @@ constexpr uint32_t BROWSE_RESET_MS = 4000;
 // SoftAP name for the first-run Wi-Fi captive portal.
 constexpr char AP_NAME[] = "Radar-Setup";
 // mDNS host: reachable as `<MDNS_HOST>.local` once on the network.
-constexpr char MDNS_HOST[] = "radar-720";
+constexpr char MDNS_HOST[] = "radar";
 
 // ---- Wi-Fi memory. ----
 // The set remembers up to this many networks (home Wi-Fi, phone

@@ -32,7 +32,10 @@ constexpr float kFollowTauMs = 1200.0f;
 // The followed flight's past path: sample its smoothed position this often
 // into a bounded trail, drawn as a dotted line behind it.
 constexpr uint32_t kTrailSampleMs = 1500;
-constexpr int kTrailMaxPoints = 40;  // ~kTrailMaxPoints * kTrailSampleMs of path.
+// Holds the historic seed (<= kTraceSeedPoints from Feeds) plus a long live
+// tail without eroding the seeded prefix; the renderer is the trail's sole
+// owner (Feeds only prepends the history once, on follow).
+constexpr int kTrailMaxPoints = 250;
 
 constexpr uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b) {
   return ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
@@ -851,6 +854,8 @@ FbState g_fb[2];
 
 int16_t g_curSweepX = 0, g_curSweepY = 0;
 bool g_curHaveSweep = false;  // This frame drew a sweep (offline suppresses it).
+bool g_viewSettled = true;    // View locked on its target (home / a followed
+                              // flight), not mid-transition; gates geography.
 
 // Offline-to-online handoff: when signal is acquired, the amber title
 // fades out and the sweep fades in over these windows, so the switch to
@@ -874,7 +879,7 @@ StaticSig staticSigOf(const Model& model) {
   s.cx = static_cast<int16_t>(lroundf(model.ui.viewCenter.x * ppn));
   s.cy = static_cast<int16_t>(lroundf(model.ui.viewCenter.y * ppn));
   s.mode = static_cast<uint8_t>(model.ui.display);
-  s.geo = model.ui.geography ? 1 : 0;
+  s.geo = (model.ui.geography && g_viewSettled) ? 1 : 0;
   // Coarse brightness steps, so ambient dither cannot trigger a ~180 ms
   // rebuild-and-repaint every second.
   s.bright = static_cast<int16_t>(lroundf(model.ui.brightness * 16.0f));
@@ -1020,20 +1025,18 @@ void drawFollowTrail(Arduino_GFX* gfx, const Model& model) {
                      static_cast<int>(model.aircraft.size()) &&
                  model.aircraft[model.ui.followIndex].special;
   uint16_t c = dim(special ? C_AMBER : C_GREEN, model.ui.brightness * 0.7f);
-  float r2 = kRadius * kRadius;
   float px = 0, py = 0;
   bool have = false;
   for (size_t i = 0; i < trail.size(); ++i) {
     float x, y;
     project(model, trail[i], x, y);
-    if (have) {  // A 3 px dot every ~7 px along the segment, inside the scope.
+    if (have) {  // A 3 px dot every ~7 px along the segment, across the panel.
       float dx = x - px, dy = y - py;
       int steps = static_cast<int>(sqrtf(dx * dx + dy * dy) / 7.0f);
       for (int s = 1; s <= steps; ++s) {
         float t = static_cast<float>(s) / steps;
         float xp = px + dx * t, yp = py + dy * t;
-        float ox = xp - kCenterX, oy = yp - kCenterY;
-        if (ox * ox + oy * oy <= r2) {
+        if (xp >= 0 && xp < g_w && yp >= 0 && yp < g_h) {
           gfx->fillCircle(static_cast<int16_t>(xp), static_cast<int16_t>(yp), 1,
                           c);
         }
@@ -1147,7 +1150,11 @@ bool buildRun(Model& model, uint32_t startUs, uint32_t budgetUs) {
         g_build.step = BuildStep::GeoBorders;
         break;
       case BuildStep::GeoBorders: {
-        if (!model.ui.geography) {
+        // Hidden while the view is in motion (any transition pan): geography
+        // can't scroll smoothly with the map, so a lagging coastline mid-pan
+        // is worse than none. It returns once the view locks on home or a
+        // followed flight (g_viewSettled).
+        if (!model.ui.geography || !g_viewSettled) {
           g_build.step = BuildStep::Airports;
           break;
         }
@@ -2093,6 +2100,20 @@ void step(Model& model, uint32_t dtMs) {
         fabsf(target.y - model.ui.viewCenter.y) * ppn < 0.5f) {
       model.ui.viewCenter = target;  // Sub-pixel: stop dithering the scene.
     }
+  }
+
+  // Geography draws only when the view is locked on its target (home, or a
+  // followed flight it is steady-tracking) — not while transitioning between
+  // them, where a lagging coastline mid-pan looks worse than none. Hysteresis
+  // on the view-to-target gap keeps it from flickering at the boundary.
+  float gapPx = freeze ? 0.0f
+                       : hypotf(target.x - model.ui.viewCenter.x,
+                                target.y - model.ui.viewCenter.y) *
+                             pixelsPerNm(model);
+  if (gapPx > 8.0f) {
+    g_viewSettled = false;
+  } else if (gapPx < 2.0f) {
+    g_viewSettled = true;
   }
 
   // Advance the sweep and refresh whatever it crossed. Derive the angle from

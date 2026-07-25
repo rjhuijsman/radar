@@ -86,21 +86,33 @@ void resumeFollow(Model& model) {
   model.ui.pausedFollow = "";  // Gone from range; nothing to resume.
 }
 
-// Aircraft indices in browse order: special (iCal/TripIt-matched) flights
-// first, then by distance from home, nearest first. The world is measured
-// from the active home at the origin, so `pos` magnitude is the home range.
+// Aircraft indices in browse order: only the flights currently ON SCREEN —
+// painted by the sweep (`seen`) and actually drawn (a blip in range, or a
+// special's edge arrow) — special (iCal/TripIt) flights first, then nearest
+// first. Distance is measured from the view center, which is the home origin
+// when idle and the followed flight while following — so browsing from home
+// orders by distance to home, and switching flights orders by distance to the
+// one you are on. Recomputed each detent, so it always reflects the current
+// on-screen picture (never landing on a flight the sweep has not revealed).
 std::vector<int> browseOrder(const Model& model) {
+  const model::Vec& c = model.ui.viewCenter;
+  float range2 = model.ui.range * model.ui.range;
+  auto dist2 = [&](const model::Aircraft& ac) {
+    float dx = ac.shown.x - c.x, dy = ac.shown.y - c.y;
+    return dx * dx + dy * dy;
+  };
   std::vector<int> order;
   for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
+    const model::Aircraft& ac = model.aircraft[i];
+    if (!ac.seen) continue;  // Not yet painted by the sweep — not on screen.
+    if (dist2(ac) > range2 && !ac.special) continue;  // Off-scope, no arrow.
     order.push_back(i);
   }
   std::sort(order.begin(), order.end(), [&](int a, int b) {
     const model::Aircraft& A = model.aircraft[a];
     const model::Aircraft& B = model.aircraft[b];
     if (A.special != B.special) return A.special;  // Specials lead.
-    float da = A.pos.x * A.pos.x + A.pos.y * A.pos.y;  // Distance² from home.
-    float db = B.pos.x * B.pos.x + B.pos.y * B.pos.y;
-    return da < db;  // Nearer first.
+    return dist2(A) < dist2(B);                     // Nearer first.
   });
   return order;
 }

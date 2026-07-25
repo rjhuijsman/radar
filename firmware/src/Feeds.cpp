@@ -618,13 +618,10 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
 // Trace tuning. The file arrives gzip-compressed no matter what the
 // request advertises (~7 KB wire, ~40 KB inflated for a typical day), so
 // it is inflated on-device with the ROM's tinfl. The size caps refuse
-// anything wildly bigger than a plausible full-day trace; the point caps
-// bound the renderer's per-frame trail walk and the mutex-held publish.
+// anything wildly bigger than a plausible full-day trace; the seed point
+// count bounds the renderer's per-frame trail walk and the seed publish.
 constexpr size_t kTraceSeedPoints = 80;    // History points seeded per follow.
-constexpr size_t kTraceMaxPoints = 200;    // History + live tail before a thin.
-constexpr size_t kTraceThinTo = 120;       // Thinned size once over the max.
 constexpr uint32_t kTraceCheckMs = 1000;   // Follow-target check cadence.
-constexpr uint32_t kTraceMendMs = 5000;    // Trail-mend cadence.
 constexpr uint32_t kTraceRetryMs = 60000;  // Refetch backoff after a failure.
 constexpr size_t kTraceMaxWireBytes = 1024 * 1024;
 constexpr size_t kTraceMaxJsonBytes = 2 * 1024 * 1024;
@@ -634,8 +631,6 @@ String g_traceHex;          // Hex the published history belongs to; "" none.
 String g_traceFailHex;      // Last hex whose fetch failed, for the backoff.
 uint32_t g_traceFailMs = 0;
 uint32_t g_traceCheckMs = 0;
-uint32_t g_traceMendMs = 0;
-std::vector<model::Vec> g_traceFull;  // Canonical history + live tail.
 
 // True for a plain 6-character lower-case ICAO address. TIS-B and
 // anonymized targets ("~" prefix) have no trace file worth asking for.
@@ -881,16 +876,6 @@ bool fetchTrace(const model::Home& home, const String& hex,
 
 // Thins `points` in place to `target`: an even spread that always keeps
 // the first and the last.
-void thinTrail(std::vector<model::Vec>& points, size_t target) {
-  if (points.size() <= target || target < 2) return;
-  std::vector<model::Vec> kept;
-  kept.reserve(target);
-  for (size_t j = 0; j < target; ++j) {
-    kept.push_back(points[j * (points.size() - 1) / (target - 1)]);
-  }
-  points = std::move(kept);
-}
-
 }  // namespace
 
 bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
@@ -1259,8 +1244,6 @@ void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
     // history, so re-following — even the same flight — reseeds fresh.
     // The trail itself is Inputs' to clear, on its follow transitions.
     g_traceHex = "";
-    g_traceFull.clear();
-    g_traceFull.shrink_to_fit();
     return;
   }
 
@@ -1288,10 +1271,8 @@ void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
     if (still) {
       history.insert(history.end(), model.ui.followTrail.begin(),
                      model.ui.followTrail.end());
-      model.ui.followTrail = history;
-      g_traceFull = std::move(history);
+      model.ui.followTrail = std::move(history);
       g_traceHex = hex;
-      g_traceMendMs = now;
     }
     xSemaphoreGive(mutex);
     if (!still) {
@@ -1300,52 +1281,9 @@ void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
     return;
   }
 
-  // Same target, already seeded: mend the trail. The renderer's bounded
-  // cap drops the oldest point for every live sample it appends past the
-  // cap, which would eat the seeded history within minutes; this merge
-  // folds the fresh live samples into the canonical trail kept here and
-  // republishes it, restoring the historic prefix. Brief and small (a
-  // couple hundred 8-byte points), so it is fine under the mutex.
-  if (now - g_traceMendMs < kTraceMendMs) return;
-  g_traceMendMs = now;
-
-  xSemaphoreTake(mutex, portMAX_DELAY);
-  bool still = model.ui.following && model.ui.followIndex >= 0 &&
-               model.ui.followIndex < static_cast<int>(model.aircraft.size()) &&
-               model.aircraft[model.ui.followIndex].hex == hex;
-  if (still) {
-    std::vector<model::Vec>& cur = model.ui.followTrail;
-    // The renderer only appends at the back and erodes at the front, so
-    // the current front sits somewhere in the canonical trail (bit-exact:
-    // both sides are verbatim copies); anything past the surviving
-    // overlap is new live tail.
-    size_t at = g_traceFull.size();
-    if (!cur.empty()) {
-      for (size_t i = 0; i < g_traceFull.size(); ++i) {
-        if (g_traceFull[i].x == cur.front().x &&
-            g_traceFull[i].y == cur.front().y) {
-          at = i;
-          break;
-        }
-      }
-    }
-    if (at == g_traceFull.size()) {
-      // No overlap left (e.g. the trail was cleared and regrown between
-      // checks): everything current is new.
-      g_traceFull.insert(g_traceFull.end(), cur.begin(), cur.end());
-    } else {
-      size_t overlap = g_traceFull.size() - at;
-      if (cur.size() > overlap) {
-        g_traceFull.insert(g_traceFull.end(), cur.begin() + overlap,
-                           cur.end());
-      }
-    }
-    if (g_traceFull.size() > kTraceMaxPoints) {
-      thinTrail(g_traceFull, kTraceThinTo);
-    }
-    cur = g_traceFull;
-  }
-  xSemaphoreGive(mutex);
+  // Same target, already seeded: the renderer owns the trail from here — it
+  // samples the live tail and its raised cap holds both the history and the
+  // tail without eroding the seeded prefix — so there is nothing more to do.
 }
 
 void reprojectStatics(model::Model& model) {
