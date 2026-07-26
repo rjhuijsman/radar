@@ -1706,20 +1706,12 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
   // Refresh the frame index (cheap; cached between refreshes) and resolve the
   // scrub range plus the selected frame.
   if (!refreshWxIndex()) return;
-  time_t realNow = time(nullptr);
-  bool synced = realNow > 1600000000;  // NTP has run.
-  int stepsBack = 0;
-  if (synced) {
-    for (int i = g_wxNowIndex - 1; i >= 0; --i) {
-      if (realNow - g_wxFrames[i].time <=
-          static_cast<time_t>(config::WEATHER_MAX_BACK_MIN) * 60) {
-        ++stepsBack;
-      } else {
-        break;
-      }
-    }
-  } else {
-    stepsBack = g_wxNowIndex > 0 ? g_wxNowIndex : 0;
+  // Rewind a fixed number of frames (50 min), not a wall-clock window, so the
+  // history is a consistent length however stale the latest frame is; capped
+  // at what the index actually holds.
+  int stepsBack = g_wxNowIndex;
+  if (stepsBack > config::WEATHER_MAX_BACK_STEPS) {
+    stepsBack = config::WEATHER_MAX_BACK_STEPS;
   }
   int stepsFwd = static_cast<int>(g_wxFrames.size()) - 1 - g_wxNowIndex;
   if (stepsFwd < 0) stepsFwd = 0;
@@ -1830,11 +1822,16 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
     }
   }
 
-  // Reveal weather only once every frame in the window is decoded, so the
-  // first scrub in any direction is instant — no visit-then-fetch. The reveal
-  // latches until the cover changes (a later rollover never drops back to
-  // acquiring), with a timeout so a flaky frame can't hold it up forever.
-  if (!g_wxRevealed) {
+  // The reveal timeout only runs in weather mode — the fill (prefetch) is
+  // weather-mode-only, so in flights mode the clock stays reset and a later
+  // switch to weather starts the fill (and this timeout) fresh, instead of
+  // "revealing" a window that was never actually buffered.
+  if (!weatherMode) g_wxFillStartMs = now;
+
+  // Reveal weather only once the whole window is decoded, so the first scrub
+  // is instant — no visit-then-fetch. Latches until the cover changes, with a
+  // timeout so a flaky frame can't hold the acquiring screen up forever.
+  if (weatherMode && !g_wxRevealed) {
     bool complete = true;
     for (int j = g_wxNowIndex - stepsBack; j <= g_wxNowIndex + stepsFwd; ++j) {
       if (j < 0 || j >= static_cast<int>(g_wxFrames.size())) continue;
@@ -1852,15 +1849,37 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
     }
   }
 
-  // Once revealed, show the selected frame and expose the scrub range; before
-  // that the range is zero, so the knob can't scrub onto an unbuffered frame.
+  // Show the selected frame once revealed.
   int ci2 = wxCacheFind(selTime);
   if (g_wxRevealed && ci2 >= 0 && selTime != g_wxLoadedTime) {
     wxPublish(model, mutex, g_wxCache[ci2]);
   }
+
+  // Expose the scrub range as the CONTIGUOUS buffered extent (once revealed),
+  // so however the cache is filling or ageing, the knob never reaches an
+  // unbuffered frame — every scrub lands on decoded data.
+  int bufBack = 0;
+  for (int k = 1; k <= stepsBack; ++k) {
+    int j = g_wxNowIndex - k;
+    if (j >= 0 && wxCacheFind(g_wxFrames[j].time) >= 0) {
+      ++bufBack;
+    } else {
+      break;
+    }
+  }
+  int bufFwd = 0;
+  for (int k = 1; k <= stepsFwd; ++k) {
+    int j = g_wxNowIndex + k;
+    if (j < static_cast<int>(g_wxFrames.size()) &&
+        wxCacheFind(g_wxFrames[j].time) >= 0) {
+      ++bufFwd;
+    } else {
+      break;
+    }
+  }
   xSemaphoreTake(mutex, portMAX_DELAY);
-  model.ui.wxStepsBack = g_wxRevealed ? stepsBack : 0;
-  model.ui.wxStepsFwd = g_wxRevealed ? stepsFwd : 0;
+  model.ui.wxStepsBack = g_wxRevealed ? bufBack : 0;
+  model.ui.wxStepsFwd = g_wxRevealed ? bufFwd : 0;
   xSemaphoreGive(mutex);
 }
 

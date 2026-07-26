@@ -71,10 +71,12 @@ constexpr uint32_t ICAL_POLL_MS = 3600000;   // iCal feed poll interval (1 h).
 constexpr uint32_t WEATHER_POLL_MS = 300000;   // Rain radar refetch interval.
 constexpr uint32_t WEATHER_CHECK_MS = 2000;    // Rain radar due-check interval.
 // Weather time-scrub: how far back the knob can rewind (RainViewer serves
-// ~2 h of past frames; an hour is plenty and keeps the on-scope clock's
-// minute hand unambiguous), and the idle timeout after which the scrub
-// snaps back to the live frame and the clock fades away.
-constexpr int WEATHER_MAX_BACK_MIN = 55;          // Rewind cap in minutes.
+// ~2 h of past frames, but the on-scope clock has only a minute hand, so the
+// rewind stops well under an hour to keep it unambiguous), and the idle
+// timeout after which the scrub snaps back to the live frame and fades.
+// A fixed frame count (not wall-clock minutes) keeps the history a consistent
+// length regardless of how stale the latest frame is.
+constexpr int WEATHER_MAX_BACK_STEPS = 5;         // 5 x 10-min frames = 50 min.
 constexpr uint32_t WEATHER_SCRUB_IDLE_MS = 5000;  // Idle -> wind back to now.
 constexpr uint32_t WEATHER_SCRUB_WINDBACK_MS = 850;  // Hand sweep back to now.
 constexpr uint32_t WEATHER_CLOCK_FADE_MS = 700;   // Clock fade-out duration.
