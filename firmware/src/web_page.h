@@ -9,7 +9,7 @@
 const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Radar 720 · Config</title>
+<title>RADAD · Config</title>
 <style>
   body { font: 15px system-ui, sans-serif; margin: 0; background: #0c1a16; color: #d9e8e0; }
   main { max-width: 620px; margin: 0 auto; padding: 20px; }
@@ -33,7 +33,7 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
   #save { width: 100%; margin-top: 22px; padding: 12px; font-size: 16px; }
 </style>
 <main>
-  <h1>🛩 Radar 720</h1>
+  <h1>🛩 RADAD</h1>
   <h2>Default range (NM)</h2>
   <div class="note">Default zoom at startup and on home-to-home switches, unless a home sets its own Zoom (below).</div>
   <div class="row"><input id="range" type="number" min="5" max="240"></div>
