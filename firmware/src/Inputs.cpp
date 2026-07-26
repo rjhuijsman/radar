@@ -162,6 +162,10 @@ void press(Model& model) {
       model.aircraft.clear();
       model.ui.candidate = -2;
       model.ui.pausedFollow = "";  // Going home cancels any paused follow.
+      // The new home's traffic has not loaded yet: re-show the acquiring
+      // screen until the immediate repoll below lands, rather than an empty
+      // dial around a home we have no blips for.
+      model.adsbLoaded = false;
       feeds::reprojectStatics(model);
       model.adsbPollDue = true;
       noteInput(model, (String("HOME: ") +

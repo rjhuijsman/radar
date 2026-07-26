@@ -691,16 +691,45 @@ bool weatherUsable(const Model& model) {
          millis() - model.weather.fetchedMs < kWxStaleMs;
 }
 
-// True when the current display mode has live data to show: a first
-// traffic poll has landed in flights mode, or a usable radar layer is in
-// hand in weather mode. Until then — and whenever Wi-Fi is down — the
-// scope holds the acquiring-signal screen instead of a bare, empty dial.
-// The sweep only turns, and the offline title only dissolves, once this
-// is true, so entering weather before its first layer (or booting before
-// the first poll) still reads as "acquiring" rather than "nothing here".
+// True when the published weather mosaic actually covers the point the
+// scope is looking at. The layer is georeferenced absolutely, so after a
+// home switch (or a pan to a fresh location) a still-fresh layer can sit
+// entirely off-view — usable, but blank here until pollWeather refetches.
+bool weatherCoversView(const Model& model) {
+  const model::WeatherLayer& wx = model.weather;
+  if (wx.cells == nullptr) return false;
+  float homeLat = 0, homeLon = 0;
+  if (model.ui.homeIndex >= 0 &&
+      model.ui.homeIndex < static_cast<int>(model.homes.size())) {
+    homeLat = model.homes[model.ui.homeIndex].latitude;
+    homeLon = model.homes[model.ui.homeIndex].longitude;
+  }
+  float lat = homeLat + model.ui.viewCenter.y / 60.0f;
+  if (lat > 85.0f || lat < -85.0f) return false;
+  float lon = homeLon + model.ui.viewCenter.x /
+                            (60.0f * cosf(homeLat * DEG_TO_RAD));
+  float scale = 256.0f * static_cast<float>(1 << wx.zoom);
+  float px = (lon + 180.0f) / 360.0f * scale;
+  float merc = asinhf(tanf(lat * DEG_TO_RAD));
+  float py = (1.0f - merc / static_cast<float>(M_PI)) * 0.5f * scale;
+  return px >= wx.originX && px < wx.originX + wx.width && py >= wx.originY &&
+         py < wx.originY + wx.height;
+}
+
+// True when the current display mode has live data to show for the point
+// on screen: a first traffic poll has landed in flights mode, or a usable
+// radar layer covering the view is in hand in weather mode. Until then —
+// and whenever Wi-Fi is down — the scope holds the acquiring-signal screen
+// instead of a bare, empty dial. The sweep only turns, and the offline
+// title only dissolves, once this is true, so booting before the first
+// poll, switching to a home whose traffic/weather has not loaded, or
+// entering weather over an uncovered location all read as "acquiring".
 bool modeDataReady(const Model& model) {
   if (!model.ui.online) return false;
-  return showWeather(model) ? weatherUsable(model) : model.adsbLoaded;
+  if (showWeather(model)) {
+    return weatherUsable(model) && weatherCoversView(model);
+  }
+  return model.adsbLoaded;
 }
 
 // Draws the weather cells whose cell-row indices lie in [rowFrom,
