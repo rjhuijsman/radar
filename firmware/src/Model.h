@@ -188,7 +188,7 @@ struct Ui {
   int wxOffsetSteps = 0;      // Selected offset from now, in 10-min frames.
   int wxStepsBack = 0;        // Past frames available to scrub to (feeds).
   int wxStepsFwd = 0;         // Nowcast frames available (feeds).
-  time_t wxFrameTime = 0;     // Wall time of the shown weather frame; 0=none.
+  time_t wxFrameTime = 0;     // Wall time of the frame actually shown; 0=none.
   uint32_t wxScrubMs = 0;     // millis() of the last time-scrub detent.
   bool wxScrubbing = false;   // Clock overlay up (scrubbing, or fading out).
 };

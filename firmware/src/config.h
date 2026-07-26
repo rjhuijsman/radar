@@ -75,7 +75,8 @@ constexpr uint32_t WEATHER_CHECK_MS = 2000;    // Rain radar due-check interval.
 // minute hand unambiguous), and the idle timeout after which the scrub
 // snaps back to the live frame and the clock fades away.
 constexpr int WEATHER_MAX_BACK_MIN = 55;          // Rewind cap in minutes.
-constexpr uint32_t WEATHER_SCRUB_IDLE_MS = 5000;  // Idle -> back to now.
+constexpr uint32_t WEATHER_SCRUB_IDLE_MS = 5000;  // Idle -> wind back to now.
+constexpr uint32_t WEATHER_SCRUB_WINDBACK_MS = 850;  // Hand sweep back to now.
 constexpr uint32_t WEATHER_CLOCK_FADE_MS = 700;   // Clock fade-out duration.
 constexpr uint32_t WEATHER_SCRUB_CHECK_MS = 400;  // Snappier fetch while scrubbing.
 constexpr float DEFAULT_RANGE_NM = 40.0f;

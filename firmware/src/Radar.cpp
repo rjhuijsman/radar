@@ -905,11 +905,40 @@ void drawToggleFlash(Arduino_GFX* gfx, const Model& model) {
   gfx->print(text);
 }
 
+// Eased offset the clock hand is actually drawn at (in 10-min frames): it
+// glides toward the knob's wxOffsetSteps so a detent sweeps the hand smoothly
+// instead of snapping, and — when the scrub idles and Inputs zeroes the
+// offset — it clearly winds the hand back to now. Maintained in step().
+float g_clockOffset = 0.0f;
+
+// A slim clock-hand wedge from the centre out to `len` at compass `ang`,
+// either filled or drawn as an outline (the "ghost" of the hand).
+void drawClockHand(Arduino_GFX* gfx, float ang, float len, uint16_t color,
+                   bool filled) {
+  float tx, ty, ax, ay, bx, by;
+  polar(ang, len, tx, ty);
+  polar(ang + 90.0f, 3.0f, ax, ay);
+  polar(ang - 90.0f, 3.0f, bx, by);
+  if (filled) {
+    gfx->fillTriangle(static_cast<int>(tx), static_cast<int>(ty),
+                      static_cast<int>(ax), static_cast<int>(ay),
+                      static_cast<int>(bx), static_cast<int>(by), color);
+  } else {
+    gfx->drawLine(static_cast<int>(ax), static_cast<int>(ay),
+                  static_cast<int>(tx), static_cast<int>(ty), color);
+    gfx->drawLine(static_cast<int>(bx), static_cast<int>(by),
+                  static_cast<int>(tx), static_cast<int>(ty), color);
+    gfx->drawLine(static_cast<int>(ax), static_cast<int>(ay),
+                  static_cast<int>(bx), static_cast<int>(by), color);
+  }
+}
+
 // The weather time-scrub clock: an analog face drawn inside the innermost
 // range ring (its edge is the clock's rim) while the knob is scrubbing time.
-// 12/3/6/9 sit on the rim; a dim hand marks the real "now", and a brighter
-// amber hand marks the selected frame's time — the angle between them is how
-// far back (or forward) the scrub has gone. Minute hand only: the scrub never
+// 12/3/6/9 sit on the rim. A dim outline — the "ghost" of the minute hand —
+// marks now, and a solid amber hand of the SAME length marks the selected
+// time: at rest they overlap, and a scrub pulls the amber hand away from its
+// ghost (10 min = 60 degrees per frame). Minute hand only: the scrub never
 // spans an hour, so it never wraps. `alpha` fades the whole overlay in and
 // out. Drawn inside a tracked span so the dirty-rect system erases it clean.
 void drawWeatherClock(Arduino_GFX* gfx, const Model& model, float alpha) {
@@ -917,6 +946,7 @@ void drawWeatherClock(Arduino_GFX* gfx, const Model& model, float alpha) {
   if (nowT < 1600000000) return;  // NTP has not run: no meaningful clock.
   float k = model.ui.brightness * alpha;
   float R = kRadius / 4.0f;  // Innermost ring radius = the clock face.
+  float handLen = R * 0.82f;
   int cx = static_cast<int>(kCenterX);
   int cy = static_cast<int>(kCenterY);
 
@@ -934,27 +964,14 @@ void drawWeatherClock(Arduino_GFX* gfx, const Model& model, float alpha) {
     gfx->print(labels[i]);
   }
 
-  // Now hand: the real wall clock, dim and short — the fixed reference.
   float nowAng = (nowT % 3600) / 3600.0f * 360.0f;
-  float nx, ny;
-  polar(nowAng, R * 0.58f, nx, ny);
-  gfx->drawLine(cx, cy, static_cast<int>(nx), static_cast<int>(ny),
-                dim(C_WHITE, k * 0.7f));
+  float selAng = nowAng + g_clockOffset * 60.0f;  // 10 min per frame = 60 deg.
 
-  // Selected hand: the shown frame, bright amber and longer — this is what
-  // the knob moves. A slim triangular wedge reads more clearly than a hair
-  // line at this size.
-  time_t selT = model.ui.wxFrameTime > 0 ? model.ui.wxFrameTime : nowT;
-  float selAng = (selT % 3600) / 3600.0f * 360.0f;
+  // Ghost of the minute hand at "now": same length, drawn as a dim outline.
+  drawClockHand(gfx, nowAng, handLen, dim(C_WHITE, k * 0.55f), false);
+  // Selected hand: solid amber, the same length — what the knob moves.
   uint16_t sel = dim(C_AMBER, k);
-  float tipX, tipY, baseAX, baseAY, baseBX, baseBY;
-  polar(selAng, R * 0.86f, tipX, tipY);
-  polar(selAng + 90.0f, 3.0f, baseAX, baseAY);
-  polar(selAng - 90.0f, 3.0f, baseBX, baseBY);
-  gfx->fillTriangle(static_cast<int>(tipX), static_cast<int>(tipY),
-                    static_cast<int>(baseAX), static_cast<int>(baseAY),
-                    static_cast<int>(baseBX), static_cast<int>(baseBY), sel);
-
+  drawClockHand(gfx, selAng, handLen, sel, true);
   gfx->fillCircle(cx, cy, 3, sel);  // Hub.
 }
 
@@ -1801,10 +1818,14 @@ void drawElem(Model& model, const Desired& d, Elem& out) {
       break;
     }
     case EKind::Clock: {
+      // Full opacity while scrubbing and through the wind-back sweep, then
+      // fade out — so the hand is clearly seen returning to now before it goes.
       uint32_t age = millis() - model.ui.wxScrubMs;
+      uint32_t fadeStart = config::WEATHER_SCRUB_IDLE_MS +
+                           config::WEATHER_SCRUB_WINDBACK_MS;
       float alpha = 1.0f;
-      if (age >= config::WEATHER_SCRUB_IDLE_MS) {
-        alpha = 1.0f - (age - config::WEATHER_SCRUB_IDLE_MS) /
+      if (age >= fadeStart) {
+        alpha = 1.0f - (age - fadeStart) /
                            static_cast<float>(config::WEATHER_CLOCK_FADE_MS);
       }
       if (alpha > 0.0f) {
@@ -2457,6 +2478,16 @@ void step(Model& model, uint32_t dtMs) {
     }
   } else {
     g_focusPrimed = false;  // Recompute afresh when focus/home resumes.
+  }
+
+  // Weather-clock hand: glide the shown offset toward the knob's selection so
+  // a detent sweeps the minute hand smoothly instead of snapping, and — once
+  // the scrub idles and Inputs zeroes the offset — clearly wind it back to now.
+  {
+    float target = static_cast<float>(model.ui.wxOffsetSteps);
+    float kk = 1.0f - expf(-dt / 200.0f);
+    g_clockOffset += (target - g_clockOffset) * kk;
+    if (fabsf(target - g_clockOffset) < 0.01f) g_clockOffset = target;
   }
 
   // Advance the sweep and refresh whatever it crossed. Derive the angle from

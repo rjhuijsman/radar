@@ -147,10 +147,11 @@ void weatherScrubTick(Model& model) {
   }
   uint32_t age = millis() - model.ui.wxScrubMs;
   if (age >= config::WEATHER_SCRUB_IDLE_MS) {
-    model.ui.wxOffsetSteps = 0;  // Back to the live frame.
-    if (age >= config::WEATHER_SCRUB_IDLE_MS + config::WEATHER_CLOCK_FADE_MS) {
-      model.ui.wxScrubbing = false;  // Clock has faded; release the overlay.
-    }
+    model.ui.wxOffsetSteps = 0;  // Zero the offset; the hand winds back to now.
+  }
+  if (age >= config::WEATHER_SCRUB_IDLE_MS + config::WEATHER_SCRUB_WINDBACK_MS +
+                 config::WEATHER_CLOCK_FADE_MS) {
+    model.ui.wxScrubbing = false;  // Wound back and faded; release the overlay.
   }
 }
 
@@ -270,7 +271,12 @@ void readToggles(Model& model) {
     // The renderer fills ui.focusSet with the top-10 in view and refreshes
     // it on every view change; just clear it when focus is released.
     if (!focus) model.ui.focusSet.clear();
-    noteInput(model, focus ? "SHOW: TOP 10" : "SHOW: ALL");
+    // The sign reflects what focus does in the current mode: cull to the
+    // followed flight (plus specials) while following, else the in-view top 10.
+    const char* msg = !focus              ? "SHOW: ALL"
+                      : model.ui.following ? "SHOW: ONLY FLIGHT"
+                                           : "SHOW: TOP 10";
+    noteInput(model, msg);
   }
 
   // Sleep (power switch, inverted): OPEN (HIGH) is the OFF position, CLOSED
