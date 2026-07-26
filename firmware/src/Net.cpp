@@ -10,6 +10,7 @@
 #include <esp_wifi.h>
 
 #include "Feeds.h"
+#include "Log.h"
 #include "config.h"
 #include "web_page.h"
 
@@ -273,6 +274,15 @@ void routes() {
   g_server.on("/api/config", AsyncWebRequestMethod::HTTP_POST,
               [](AsyncWebServerRequest* request) {}, nullptr,
               handleConfigBody);
+  // The device's recent diagnostics, mirrored from the serial console into a
+  // RAM ring — a plain-text "serial over Wi-Fi" for a board that's mounted and
+  // only reachable on the network.
+  g_server.on("/api/log", AsyncWebRequestMethod::HTTP_GET,
+              [](AsyncWebServerRequest* request) {
+    String out;
+    rlog::Log.dump(out);
+    request->send(200, "text/plain; charset=utf-8", out);
+  });
 }
 
 // Arms ArduinoOTA (Wi-Fi firmware and filesystem updates) with a hashed
