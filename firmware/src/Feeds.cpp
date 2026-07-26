@@ -1235,8 +1235,10 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   if (model.ui.browseSel >= count) model.ui.browseSel = -1;
   if (model.ui.candidate >= count) model.ui.candidate = -2;
   // A poll has now landed: the renderer can drop the acquiring-signal
-  // screen for the live scope (even if the sky happens to be empty).
+  // screen for the live scope (even if the sky happens to be empty), and
+  // refresh the focus "top 10" against the new aircraft set.
   model.adsbLoaded = true;
+  ++model.adsbGen;
   xSemaphoreGive(mutex);
 
   Serial.printf("[feeds] adsb: %d aircraft (%u in range, %lu ms, heap %u KB)\n",

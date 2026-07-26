@@ -139,7 +139,9 @@ struct Ui {
   float range = 40.0f;         // Current display range in NM.
   float defaultRange = 40.0f;  // Zoom applied at boot and home-to-home switch.
   DisplayMode display = DisplayMode::Flights;
-  bool cities = false;         // City-markers overlay on/off.
+  bool focus = false;          // Focus filter: show only the important flights.
+  std::vector<String> focusSet;  // Home-mode top-flier callsigns, frozen when
+                                 // focus engaged; specials shown on top always.
   Screen screen = Screen::On;
 
   bool zoomHold = false;       // Encoder held: turning zooms, not browses.
@@ -202,11 +204,33 @@ struct Model {
   // right away instead of waiting out the hourly interval.
   bool icalPollDue = false;
 
-  // Set true once the first traffic poll has published. Until then the
-  // renderer holds the acquiring-signal screen in flights mode rather than
-  // flashing a bare, empty dial. Never reset: a Wi-Fi drop shows the last
-  // blips again the moment it reconnects, no re-acquiring flash needed.
+  // Set true once the first traffic poll has published. Held in flights
+  // mode so the renderer keeps the acquiring-signal screen up rather than
+  // flashing a bare, empty dial; a home switch resets it (Inputs) so the
+  // new home re-acquires. A Wi-Fi drop keeps the last blips and re-shows
+  // them the moment it reconnects — no re-acquiring flash for a reconnect.
   bool adsbLoaded = false;
+
+  // Bumped on every traffic publish, so the renderer can refresh the focus
+  // "top 10" when the aircraft set changes without diffing it each frame.
+  uint32_t adsbGen = 0;
 };
+
+// True when aircraft `index` should be drawn and be selectable under the
+// current focus filter. Focus off shows everything. Focus on always keeps
+// the special flights; besides those, follow mode keeps only the followed
+// flight, and home mode keeps only the callsigns frozen into ui.focusSet
+// when focus was engaged (the top-10-by-altitude snapshot). Shared by the
+// renderer's desired list and the encoder's browse order so a hidden
+// flight can neither be drawn nor selected.
+inline bool flightVisible(const Model& m, const Aircraft& ac, int index) {
+  if (!m.ui.focus) return true;
+  if (ac.special) return true;
+  if (m.ui.following) return index == m.ui.followIndex;
+  for (const String& cs : m.ui.focusSet) {
+    if (cs == ac.callsign) return true;
+  }
+  return false;
+}
 
 }  // namespace model

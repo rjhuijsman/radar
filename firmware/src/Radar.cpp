@@ -4,6 +4,7 @@
 #include <math.h>
 #include <string.h>
 
+#include <algorithm>
 #include <utility>
 #include <vector>
 
@@ -732,6 +733,37 @@ bool modeDataReady(const Model& model) {
   return model.adsbLoaded;
 }
 
+// Fills ui.focusSet with the top-flying flights currently in view, for the
+// focus filter's home-mode "top 10". The special flights are always shown
+// (and drawn on top), so they take the first of the ten slots; the rest go
+// to the highest-flying — tie-break fastest — ordinary flights inside the
+// current scope disc. step() calls this whenever the view (pan, zoom, home)
+// or the traffic changes, so the set tracks exactly what is on screen.
+void computeFocusSet(Model& model) {
+  int specialCount = 0;
+  std::vector<int> pool;
+  for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
+    const Aircraft& ac = model.aircraft[i];
+    if (ac.special) {
+      ++specialCount;
+    } else if (distanceFrom(model, ac.pos) <= model.ui.range) {
+      pool.push_back(i);  // Ordinary, and inside the current view.
+    }
+  }
+  std::sort(pool.begin(), pool.end(), [&](int a, int b) {
+    const Aircraft& A = model.aircraft[a];
+    const Aircraft& B = model.aircraft[b];
+    if (A.altitude != B.altitude) return A.altitude > B.altitude;
+    return A.groundSpeed > B.groundSpeed;
+  });
+  int slots = 10 - specialCount;
+  if (slots < 0) slots = 0;
+  model.ui.focusSet.clear();
+  for (int i = 0; i < slots && i < static_cast<int>(pool.size()); ++i) {
+    model.ui.focusSet.push_back(model.aircraft[pool[i]].callsign);
+  }
+}
+
 // Draws the weather cells whose cell-row indices lie in [rowFrom,
 // rowTo) — resumable for the sliced rebuild; blocking callers pass the
 // full range. One cell row is y0 = row * kWxCellPx.
@@ -853,7 +885,7 @@ void drawToggleFlash(Arduino_GFX* gfx, const Model& model) {
     text = "WEATHER";
   } else if (model.ui.lastInput == "DISPLAY: FLIGHTS") {
     text = "FLIGHTS";
-  } else if (model.ui.lastInput.startsWith("CITIES") ||
+  } else if (model.ui.lastInput.startsWith("SHOW") ||
              model.ui.lastInput.startsWith("HOME")) {
     text = model.ui.lastInput;
   } else {
@@ -971,6 +1003,13 @@ bool g_viewSettled = true;    // View locked on its target (home / a followed
                               // flight), not mid-transition; gates the
                               // geography and city overlays.
 
+// Focus "top 10" recompute bookkeeping: the set is refreshed only when the
+// settled view or the traffic differs from what it was last computed for, so
+// membership stays stable between changes instead of churning every frame.
+bool g_focusPrimed = false;
+uint32_t g_focusVSig = 0;  // View signature focusSet was last computed for.
+uint32_t g_focusGen = 0;   // Traffic generation focusSet was last computed for.
+
 // Acquiring-to-live handoff: when the current mode's data first arrives
 // (Wi-Fi up AND a traffic poll or radar layer in hand), the amber title
 // fades out and the sweep fades in over these windows, so the switch to
@@ -1000,7 +1039,10 @@ StaticSig staticSigOf(const Model& model) {
   // Geography always draws once the view settles; the settle state
   // alone re-fingerprints it in and out around a transition pan.
   s.geo = g_viewSettled ? 1 : 0;
-  s.cities = (model.ui.cities && g_viewSettled) ? 1 : 0;
+  // Cities are always drawn now (the toggle became Focus); like geography
+  // they only hide while the view is mid-pan, so they track the settle
+  // state alone.
+  s.cities = g_viewSettled ? 1 : 0;
   // Coarse brightness steps, so ambient dither cannot trigger a ~180 ms
   // rebuild-and-repaint every second.
   s.bright = static_cast<int16_t>(lroundf(model.ui.brightness * 16.0f));
@@ -1363,11 +1405,10 @@ bool buildRun(Model& model, uint32_t startUs, uint32_t budgetUs) {
         break;
       }
       case BuildStep::Cities:
-        // Cities follow their toggle, and share the geography's
-        // settled-view gate so they never smear through a pan. The
-        // whole layer is one unit: ~10 markers cost less than a
-        // single geography slice.
-        if (model.ui.cities && g_viewSettled) drawCities(gfx, model);
+        // Cities are always shown; they share the geography's settled-view
+        // gate so they never smear through a pan. The whole layer is one
+        // unit: ~10 markers cost less than a single geography slice.
+        if (g_viewSettled) drawCities(gfx, model);
         g_build.step = BuildStep::Airports;
         break;
       case BuildStep::Airports: {
@@ -1631,6 +1672,9 @@ void computeDesired(const Model& model) {
                                   static_cast<int16_t>(i), -1, false});
     }
     for (int i = 0; i < static_cast<int>(model.aircraft.size()); ++i) {
+      // The focus filter hides ordinary traffic (see model::flightVisible);
+      // specials and the followed flight always survive it.
+      if (!model::flightVisible(model, model.aircraft[i], i)) continue;
       uint32_t key;
       if (aircraftDesire(model, model.aircraft[i], i, key)) {
         g_desired.push_back(Desired{0x20000000u + i, key, EKind::Aircraft,
@@ -2313,6 +2357,30 @@ void step(Model& model, uint32_t dtMs) {
     g_viewSettled = false;
   } else if (gapPx < 2.0f) {
     g_viewSettled = true;
+  }
+
+  // Focus "top 10": keep the in-view top fliers current. Recompute when the
+  // view has settled somewhere new (pan, zoom, home) or fresh traffic has
+  // landed; keying off a signature keeps membership stable between polls (the
+  // inputs are identical), so blips don't flicker in and out. Only home mode
+  // uses the set — following shows the followed flight plus specials.
+  if (model.ui.focus && !model.ui.following && g_viewSettled) {
+    float ppn = pixelsPerNm(model);
+    uint32_t vsig = mix(2166136261u,
+                        static_cast<uint32_t>(lroundf(model.ui.range * 100.0f)));
+    vsig = mix(vsig,
+               static_cast<uint32_t>(lroundf(model.ui.viewCenter.x * ppn)));
+    vsig = mix(vsig,
+               static_cast<uint32_t>(lroundf(model.ui.viewCenter.y * ppn)));
+    vsig = mix(vsig, static_cast<uint32_t>(model.ui.homeIndex));
+    if (!g_focusPrimed || vsig != g_focusVSig || model.adsbGen != g_focusGen) {
+      computeFocusSet(model);
+      g_focusVSig = vsig;
+      g_focusGen = model.adsbGen;
+      g_focusPrimed = true;
+    }
+  } else {
+    g_focusPrimed = false;  // Recompute afresh when focus/home resumes.
   }
 
   // Advance the sweep and refresh whatever it crossed. Derive the angle from

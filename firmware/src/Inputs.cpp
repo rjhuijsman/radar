@@ -106,6 +106,7 @@ std::vector<int> browseOrder(const Model& model) {
     const model::Aircraft& ac = model.aircraft[i];
     if (!ac.seen) continue;  // Not yet painted by the sweep — not on screen.
     if (dist2(ac) > range2 && !ac.special) continue;  // Off-scope, no arrow.
+    if (!model::flightVisible(model, ac, i)) continue;  // Hidden by focus.
     order.push_back(i);
   }
   std::sort(order.begin(), order.end(), [&](int a, int b) {
@@ -186,7 +187,7 @@ void readToggles(Model& model) {
   DisplayMode display = digitalRead(config::PIN_DISPLAY) == LOW
                             ? DisplayMode::Flights
                             : DisplayMode::Weather;
-  bool cities = digitalRead(config::PIN_CITIES) == HIGH;
+  bool focus = digitalRead(config::PIN_FOCUS) == HIGH;
 
   if (!g_togglesInit) {
     // First poll after boot: adopt the physical switch positions silently, so
@@ -194,7 +195,7 @@ void readToggles(Model& model) {
     // a spurious mode message on startup.
     g_togglesInit = true;
     model.ui.display = display;
-    model.ui.cities = cities;
+    model.ui.focus = focus;  // The renderer computes the top-10 set per view.
     return;
   }
 
@@ -220,9 +221,12 @@ void readToggles(Model& model) {
                                                      : "DISPLAY: FLIGHTS");
   }
 
-  if (cities != model.ui.cities) {
-    model.ui.cities = cities;
-    noteInput(model, cities ? "CITIES: ON" : "CITIES: OFF");
+  if (focus != model.ui.focus) {
+    model.ui.focus = focus;
+    // The renderer fills ui.focusSet with the top-10 in view and refreshes
+    // it on every view change; just clear it when focus is released.
+    if (!focus) model.ui.focusSet.clear();
+    noteInput(model, focus ? "SHOW: TOP 10" : "SHOW: ALL");
   }
 
   // Sleep (power switch, inverted): OPEN (HIGH) is the OFF position, CLOSED
@@ -288,7 +292,7 @@ void readKnob(Model& model) {
 void begin() {
   pinMode(config::PIN_SLEEP, INPUT_PULLUP);
   pinMode(config::PIN_DISPLAY, INPUT_PULLUP);
-  pinMode(config::PIN_CITIES, INPUT_PULLUP);
+  pinMode(config::PIN_FOCUS, INPUT_PULLUP);
 
   // display::begin() already ran Wire.begin(SDA=8, SCL=18) before this task
   // starts, so the bus is up. Modulino.begin() calls the no-arg Wire.begin(),
