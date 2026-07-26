@@ -691,6 +691,18 @@ bool weatherUsable(const Model& model) {
          millis() - model.weather.fetchedMs < kWxStaleMs;
 }
 
+// True when the current display mode has live data to show: a first
+// traffic poll has landed in flights mode, or a usable radar layer is in
+// hand in weather mode. Until then — and whenever Wi-Fi is down — the
+// scope holds the acquiring-signal screen instead of a bare, empty dial.
+// The sweep only turns, and the offline title only dissolves, once this
+// is true, so entering weather before its first layer (or booting before
+// the first poll) still reads as "acquiring" rather than "nothing here".
+bool modeDataReady(const Model& model) {
+  if (!model.ui.online) return false;
+  return showWeather(model) ? weatherUsable(model) : model.adsbLoaded;
+}
+
 // Draws the weather cells whose cell-row indices lie in [rowFrom,
 // rowTo) — resumable for the sliced rebuild; blocking callers pass the
 // full range. One cell row is y0 = row * kWxCellPx.
@@ -930,11 +942,14 @@ bool g_viewSettled = true;    // View locked on its target (home / a followed
                               // flight), not mid-transition; gates the
                               // geography and city overlays.
 
-// Offline-to-online handoff: when signal is acquired, the amber title
+// Acquiring-to-live handoff: when the current mode's data first arrives
+// (Wi-Fi up AND a traffic poll or radar layer in hand), the amber title
 // fades out and the sweep fades in over these windows, so the switch to
-// the live scope is a dissolve rather than a hard cut.
-bool g_wasOnline = false;
-uint32_t g_onlineSinceMs = 0;  // millis() when online last became true.
+// the live scope is a dissolve rather than a hard cut. It tracks the
+// mode-data-ready edge (see modeDataReady), not merely Wi-Fi, so a mode
+// with nothing yet to draw keeps showing the title until its feed lands.
+bool g_wasReady = false;
+uint32_t g_readySinceMs = 0;  // millis() when data last became ready.
 constexpr uint32_t kSignalFadeMs = 900;
 constexpr uint32_t kSweepFadeMs = 1800;
 
@@ -1559,7 +1574,8 @@ void computeDesired(const Model& model) {
   g_desired.clear();
   int brightStep = static_cast<int>(model.ui.brightness * 16.0f);
   uint32_t now = millis();
-  uint32_t onlineAge = now - g_onlineSinceMs;
+  bool ready = modeDataReady(model);
+  uint32_t readyAge = now - g_readySinceMs;
 
   {
     float x, y;
@@ -1594,9 +1610,9 @@ void computeDesired(const Model& model) {
     }
   }
 
-  // Toggle feedback flashes on the live scope; offline, the input-test
-  // line inside drawAcquiringSignal already covers every control event.
-  if (model.ui.online && !model.ui.lastInput.isEmpty() &&
+  // Toggle feedback flashes on the live scope; while acquiring, the
+  // input-test line inside drawAcquiringSignal already covers every event.
+  if (ready && !model.ui.lastInput.isEmpty() &&
       now - model.ui.lastInputMs < 2500) {
     uint32_t h = mix(hashStr(model.ui.lastInput),
                      (now - model.ui.lastInputMs) / 80);
@@ -1604,9 +1620,9 @@ void computeDesired(const Model& model) {
     g_desired.push_back(Desired{0x30000001u, h, EKind::Flash, 0, -1, false});
   }
 
-  // The acquiring-signal title pulses while offline and dissolves just
-  // after signal is acquired; it repaints every frame either way.
-  if (!model.ui.online || onlineAge < kSignalFadeMs) {
+  // The acquiring-signal title pulses while the mode has no data yet and
+  // dissolves just after it arrives; it repaints every frame either way.
+  if (!ready || readyAge < kSignalFadeMs) {
     g_desired.push_back(
         Desired{0x30000002u, ++g_seq, EKind::Signal, 0, -1, false});
   }
@@ -1637,11 +1653,11 @@ void drawElem(Model& model, const Desired& d, Elem& out) {
       endTrackPush();
       break;
     case EKind::Signal: {
-      uint32_t onlineAge = millis() - g_onlineSinceMs;
+      bool ready = modeDataReady(model);
+      uint32_t readyAge = millis() - g_readySinceMs;
       float fade =
-          model.ui.online
-              ? 1.0f - onlineAge / static_cast<float>(kSignalFadeMs)
-              : 1.0f;
+          ready ? 1.0f - readyAge / static_cast<float>(kSignalFadeMs)
+                : 1.0f;
       if (fade > 0.0f) {
         g_live->beginTrack();
         drawAcquiringSignal(g_live, model, fade);
@@ -2005,11 +2021,13 @@ void renderIncremental(Model& model) {
   g_prevFrameStartUs = frameStartUs;
   ++g_frameCount;
 
-  // Track the offline-to-online edge that drives the handoff dissolve
-  // (title fading out, sweep fading in).
-  if (model.ui.online != g_wasOnline) {
-    g_wasOnline = model.ui.online;
-    if (model.ui.online) g_onlineSinceMs = millis();
+  // Track the acquiring-to-live edge that drives the handoff dissolve
+  // (title fading out, sweep fading in): the current mode's first data,
+  // not merely Wi-Fi (see modeDataReady).
+  bool ready = modeDataReady(model);
+  if (ready != g_wasReady) {
+    g_wasReady = ready;
+    if (ready) g_readySinceMs = millis();
   }
 
   // React to static-scene changes. Discrete switches take the blocking
@@ -2090,7 +2108,7 @@ void renderIncremental(Model& model) {
   // crosses repaint, keeping the blips-over-sweep z-order.
   Seg newSweep{0, 0, 0, 0};
   bool haveNewSweep = false;
-  if (model.ui.online) {
+  if (ready) {
     float sx, sy;
     polar(model.ui.sweepAngle, kRadius, sx, sy);
     newSweep =
@@ -2150,13 +2168,13 @@ void renderIncremental(Model& model) {
   // Draw pass: the sweep first (under everything), then the changed
   // elements in z order; unchanged elements keep their pixels and carry
   // their bookkeeping forward.
-  uint32_t onlineAge = millis() - g_onlineSinceMs;
-  if (model.ui.online) {
-    // The sweep only turns once signal is acquired, fading in over the
-    // handoff window; offline it is neither drawn nor tracked.
-    float fade = onlineAge >= kSweepFadeMs
+  uint32_t readyAge = millis() - g_readySinceMs;
+  if (ready) {
+    // The sweep only turns once the mode has data, fading in over the
+    // handoff window; while acquiring it is neither drawn nor tracked.
+    float fade = readyAge >= kSweepFadeMs
                      ? 1.0f
-                     : onlineAge / static_cast<float>(kSweepFadeMs);
+                     : readyAge / static_cast<float>(kSweepFadeMs);
     drawSweep(g_live, model, fade);
     g_curSweepX = newSweep.x1;
     g_curSweepY = newSweep.y1;

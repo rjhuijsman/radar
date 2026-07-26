@@ -201,6 +201,12 @@ struct Model {
   // every config save, so a just-added feed or manual special is matched
   // right away instead of waiting out the hourly interval.
   bool icalPollDue = false;
+
+  // Set true once the first traffic poll has published. Until then the
+  // renderer holds the acquiring-signal screen in flights mode rather than
+  // flashing a bare, empty dial. Never reset: a Wi-Fi drop shows the last
+  // blips again the moment it reconnects, no re-acquiring flash needed.
+  bool adsbLoaded = false;
 };
 
 }  // namespace model
