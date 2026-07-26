@@ -129,25 +129,25 @@ void networkTask(void*) {
     // a home switch raises it for an immediate repopulate. The interval
     // fallback covers a stalled render loop (e.g. display init failure).
     bool adsbDue = false;
-    bool scrubbing = false;
+    bool weatherMode = false;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
     if (g_model.adsbPollDue) {
       g_model.adsbPollDue = false;
       adsbDue = true;
     }
-    scrubbing = g_model.ui.wxScrubbing;
+    weatherMode = g_model.ui.display == model::DisplayMode::Weather;
     xSemaphoreGive(g_mutex);
     if (adsbDue || now - lastAdsb >= 2 * config::ADSB_POLL_MS) {
       lastAdsb = now;
       feeds::pollTraffic(g_model, g_mutex);
     }
-    // Weather checks are frequent but cheap: pollWeather itself decides
-    // when a real fetch is due (refetch interval elapsed, the view settled
-    // on tiles the fetched mosaic no longer covers, or a time-scrub selected
-    // a different frame). Checks run more often while scrubbing so a rewind
-    // lands promptly.
+    // Weather checks are frequent but cheap: pollWeather itself decides what
+    // to fetch (the selected frame first, then one prefetch per call). In
+    // weather mode it runs often so the frame cache fills quickly and a scrub
+    // lands on decoded data; in flights mode it just keeps the live frame
+    // fresh in the background.
     uint32_t wxInterval =
-        scrubbing ? config::WEATHER_SCRUB_CHECK_MS : config::WEATHER_CHECK_MS;
+        weatherMode ? config::WEATHER_SCRUB_CHECK_MS : config::WEATHER_CHECK_MS;
     if (now - lastWeather >= wxInterval) {
       lastWeather = now;
       feeds::pollWeather(g_model, g_mutex);

@@ -1597,7 +1597,12 @@ bool pipeYield() { return g_prevFrameLate && g_frameCount % 3 != 0; }
 // trail growth).
 bool sigUrgent(const StaticSig& a, const StaticSig& b) {
   return a.range100 != b.range100 || a.mode != b.mode || a.geo != b.geo ||
-         a.cities != b.cities || a.online != b.online || a.home != b.home;
+         a.cities != b.cities || a.online != b.online || a.home != b.home ||
+         // A new weather frame while scrubbing time should land at once, not
+         // drift in over the pipeline's ~1 s — the whole point of the cache is
+         // that the rewound rain tracks the clock. (Rate-limited like any
+         // urgent rebuild, so a fast scrub still can't thrash it.)
+         a.wxGen != b.wxGen;
 }
 
 // Abandons in-flight pipeline work: the spare's half-painted scene is

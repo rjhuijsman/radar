@@ -16,6 +16,7 @@
 #include <set>
 #include <vector>
 
+#include "Log.h"
 #include "config.h"
 
 namespace feeds {
@@ -225,7 +226,7 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
   // PSRAM, but the TLS session and parser scratch live on the internal
   // heap. Skipping one poll is invisible; an OOM abort is not.
   if (ESP.getFreeHeap() < 40 * 1024) {
-    Serial.printf("[feeds] adsb: heap low (%u KB); skipping poll.\n",
+    rlog::Log.printf("[feeds] adsb: heap low (%u KB); skipping poll.\n",
                   ESP.getFreeHeap() / 1024);
     return false;
   }
@@ -233,7 +234,7 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
   if (!http.begin(client, url)) return false;
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[feeds] adsb: HTTP %d; keeping last data.\n", code);
+    rlog::Log.printf("[feeds] adsb: HTTP %d; keeping last data.\n", code);
     http.end();
     return false;
   }
@@ -241,7 +242,7 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
   // KB; anything wildly larger is not a traffic snapshot.
   int announced = http.getSize();
   if (announced > 4 * 1024 * 1024) {
-    Serial.printf("[feeds] adsb: %d-byte body refused.\n", announced);
+    rlog::Log.printf("[feeds] adsb: %d-byte body refused.\n", announced);
     http.end();
     return false;
   }
@@ -265,14 +266,14 @@ bool fetchTraffic(const model::Home& home, std::vector<Parsed>& out) {
       deserializeJson(doc, reader, DeserializationOption::Filter(filter));
   http.end();
   if (err) {
-    Serial.printf("[feeds] adsb: parse failed (%s); keeping last data.\n",
+    rlog::Log.printf("[feeds] adsb: parse failed (%s); keeping last data.\n",
                   err.c_str());
     return false;
   }
   // A response without the aircraft array is not a traffic snapshot; do
   // not let it wipe the scope. An empty array is legitimately quiet sky.
   if (!doc["ac"].is<JsonArrayConst>()) {
-    Serial.println("[feeds] adsb: no 'ac' array; keeping last data.");
+    rlog::Log.println("[feeds] adsb: no 'ac' array; keeping last data.");
     return false;
   }
 
@@ -355,7 +356,7 @@ void fetchGlobalSpecials(const model::Home& home,
           }
         }
       } else {
-        Serial.printf("[feeds] adsb: global HTTP %d for %s.\n", code,
+        rlog::Log.printf("[feeds] adsb: global HTTP %d for %s.\n", code,
                       callsign.c_str());
       }
       http.end();
@@ -401,7 +402,9 @@ constexpr int kWxMaxZoom = 7;   // RainViewer's documented tile maximum.
 constexpr int kWxMinZoom = 2;
 constexpr float kWxCoverMargin = 1.15f;  // Fetch a hair past the disc.
 constexpr uint32_t kWxSettleMs = 3000;
-constexpr uint32_t kWxRetryMs = 30000;
+// Backoff after a failed tile transfer: short, so a scrub recovers quickly
+// (the cache fetches one frame per poll, and each attempt is one transfer).
+constexpr uint32_t kWxRetryMs = 4000;
 constexpr size_t kWxMaxPngBytes = 192 * 1024;  // Sanity cap per tile.
 
 // The palette RainViewer actually serves. The tile URL's {color}
@@ -635,7 +638,7 @@ bool refreshWxIndex() {
   }
   String body;
   if (!httpGet("https://api.rainviewer.com/public/weather-maps.json", body)) {
-    Serial.println("[feeds] wx: index fetch failed.");
+    rlog::Log.println("[feeds] wx: index fetch failed.");
     // A previously fetched frame set stays valid for a while; reuse it.
     return !g_wxFrames.empty();
   }
@@ -645,7 +648,7 @@ bool refreshWxIndex() {
   const char* host = doc["host"];
   JsonArrayConst past = doc["radar"]["past"].as<JsonArrayConst>();
   if (host == nullptr || past.size() == 0) {
-    Serial.println("[feeds] wx: index has no radar frames.");
+    rlog::Log.println("[feeds] wx: index has no radar frames.");
     return false;
   }
   std::vector<WxFrame> frames;
@@ -679,7 +682,7 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
   if (!http.begin(client, url)) return false;
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
-    Serial.printf("[feeds] wx: HTTP %d for tile.\n", code);
+    rlog::Log.printf("[feeds] wx: HTTP %d for tile.\n", code);
     http.end();
     return false;
   }
@@ -688,7 +691,7 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
   // into a full timeout. Fail fast instead.
   int announced = http.getSize();
   if (announced <= 0 || announced > static_cast<int>(kWxMaxPngBytes)) {
-    Serial.printf("[feeds] wx: %d-byte tile refused.\n", announced);
+    rlog::Log.printf("[feeds] wx: %d-byte tile refused.\n", announced);
     http.end();
     return false;
   }
@@ -697,7 +700,7 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
                                 static_cast<size_t>(announced));
   http.end();
   if (len != static_cast<size_t>(announced)) {
-    Serial.println("[feeds] wx: short tile body.");
+    rlog::Log.println("[feeds] wx: short tile body.");
     return false;
   }
 
@@ -705,12 +708,12 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
   ctx.offY = offY;
   if (g_wxPng->openRAM(pngBuf, static_cast<int>(len), wxPngLine) !=
       PNG_SUCCESS) {
-    Serial.println("[feeds] wx: tile is not a PNG.");
+    rlog::Log.println("[feeds] wx: tile is not a PNG.");
     return false;
   }
   if (g_wxPng->getWidth() != kWxTileSize ||
       g_wxPng->getHeight() != kWxTileSize) {
-    Serial.printf("[feeds] wx: unexpected %dx%d tile.\n", g_wxPng->getWidth(),
+    rlog::Log.printf("[feeds] wx: unexpected %dx%d tile.\n", g_wxPng->getWidth(),
                   g_wxPng->getHeight());
     g_wxPng->close();
     return false;
@@ -718,7 +721,7 @@ bool wxFetchTile(HTTPClient& http, WiFiClientSecure& client, const String& url,
   int rc = g_wxPng->decode(&ctx, 0);
   g_wxPng->close();
   if (rc != PNG_SUCCESS) {
-    Serial.printf("[feeds] wx: PNG decode failed (%d).\n", rc);
+    rlog::Log.printf("[feeds] wx: PNG decode failed (%d).\n", rc);
     return false;
   }
   return true;
@@ -1003,7 +1006,7 @@ bool fetchTrace(const model::Home& home, const String& hex,
   if (ESP.getFreeHeap() < 40 * 1024 ||
       heap_caps_get_free_size(MALLOC_CAP_SPIRAM) <
           kTraceMaxWireBytes + 512 * 1024) {
-    Serial.printf(
+    rlog::Log.printf(
         "[feeds] trace: memory low (heap %u KB, PSRAM %u KB); skipping.\n",
         ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
     return false;
@@ -1027,13 +1030,13 @@ bool fetchTrace(const model::Home& home, const String& hex,
   int code = http.GET();
   if (code != HTTP_CODE_OK) {
     // 404 is simply a flight adsb.lol has no trace for.
-    Serial.printf("[feeds] trace: HTTP %d for %s.\n", code, hex.c_str());
+    rlog::Log.printf("[feeds] trace: HTTP %d for %s.\n", code, hex.c_str());
     http.end();
     return false;
   }
   int announced = http.getSize();
   if (announced > static_cast<int>(kTraceMaxWireBytes)) {
-    Serial.printf("[feeds] trace: %d-byte body refused.\n", announced);
+    rlog::Log.printf("[feeds] trace: %d-byte body refused.\n", announced);
     http.end();
     return false;
   }
@@ -1042,7 +1045,7 @@ bool fetchTrace(const model::Home& home, const String& hex,
   http.end();
   if (raw == nullptr || wire == 0) {
     heap_caps_free(raw);
-    Serial.println("[feeds] trace: body read failed.");
+    rlog::Log.println("[feeds] trace: body read failed.");
     return false;
   }
 
@@ -1055,7 +1058,7 @@ bool fetchTrace(const model::Home& home, const String& hex,
     json = gunzip(raw, wire, jsonLen);
     heap_caps_free(raw);
     if (json == nullptr) {
-      Serial.println("[feeds] trace: gunzip failed.");
+      rlog::Log.println("[feeds] trace: gunzip failed.");
       return false;
     }
   }
@@ -1074,7 +1077,7 @@ bool fetchTrace(const model::Home& home, const String& hex,
   });
   if (valid == 0) {
     heap_caps_free(json);
-    Serial.printf("[feeds] trace: no plottable points for %s.\n", hex.c_str());
+    rlog::Log.printf("[feeds] trace: no plottable points for %s.\n", hex.c_str());
     return false;
   }
 
@@ -1100,7 +1103,7 @@ bool fetchTrace(const model::Home& home, const String& hex,
   });
   heap_caps_free(json);
 
-  Serial.printf(
+  rlog::Log.printf(
       "[feeds] trace: %s %u B wire -> %u B json, %u pts (%u since takeoff) "
       "-> %u kept (%lu ms, heap %u KB)\n",
       hex.c_str(), static_cast<unsigned>(wire), static_cast<unsigned>(jsonLen),
@@ -1195,7 +1198,7 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
         ++merged;
       }
     }
-    Serial.printf(
+    rlog::Log.printf(
         "[feeds] adsb: %u global special lookup(s) -> %u merged, %u held.\n",
         static_cast<unsigned>(wanted.size()), static_cast<unsigned>(merged),
         static_cast<unsigned>(held.size()));
@@ -1210,7 +1213,7 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   // already requested a fresh poll around the new home.
   if (activeHome(model).name != home.name) {
     xSemaphoreGive(mutex);
-    Serial.println("[feeds] adsb: home changed mid-fetch; snapshot dropped.");
+    rlog::Log.println("[feeds] adsb: home changed mid-fetch; snapshot dropped.");
     return false;
   }
 
@@ -1274,7 +1277,7 @@ bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
   ++model.adsbGen;
   xSemaphoreGive(mutex);
 
-  Serial.printf("[feeds] adsb: %d aircraft (%u in range, %lu ms, heap %u KB)\n",
+  rlog::Log.printf("[feeds] adsb: %d aircraft (%u in range, %lu ms, heap %u KB)\n",
                 count, static_cast<unsigned>(inRange),
                 static_cast<unsigned long>(millis() - started),
                 ESP.getFreeHeap() / 1024);
@@ -1534,7 +1537,7 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
   // task, so it needs no lock; the dashboard-facing lists go into the
   // model under the mutex, briefly.
   g_specials = found;
-  Serial.printf(
+  rlog::Log.printf(
       "[feeds] ical: %d/%u feed(s) ok, %u calendar + %u manual entries -> "
       "%u special callsign(s) for %s\n",
       fetched, static_cast<unsigned>(enabled.size()),
@@ -1548,12 +1551,148 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
   return fetched;
 }
 
+// ---- Prefetched frame cache (instant time-scrub). ----
+//
+// So a scrub lands on an already-decoded frame instead of waiting on a
+// fetch, every selectable frame's mosaic is decoded once — for the current
+// view cover — and kept in PSRAM. pollWeather fetches the frame under the
+// knob first, then fills the rest one per call; a settled pan/zoom to a
+// different cover drops the cache and re-decodes there. The displayed layer
+// (model.weather) is a self-owned copy, so freeing the cache never blanks
+// the picture mid-refill.
+
+struct WxCacheEntry {
+  time_t time = 0;
+  uint8_t* cells = nullptr;
+  int16_t width = 0, height = 0;
+  uint8_t zoom = 0;
+  int32_t originX = 0, originY = 0;
+};
+std::vector<WxCacheEntry> g_wxCache;
+WxCover g_wxCacheCover;         // Cover every cached mosaic shares.
+bool g_wxCacheCoverSet = false;
+bool g_wxRevealed = false;      // The window for this cover has fully decoded
+                                // (or timed out): frames may be shown/scrubbed.
+uint32_t g_wxFillStartMs = 0;   // millis() when the current cover's fill began.
+
+int wxCacheFind(time_t t) {
+  for (int i = 0; i < static_cast<int>(g_wxCache.size()); ++i) {
+    if (g_wxCache[i].time == t) return i;
+  }
+  return -1;
+}
+
+void wxCacheClear() {
+  for (auto& e : g_wxCache) heap_caps_free(e.cells);
+  g_wxCache.clear();
+}
+
+// Fetches and decodes every tile of `cover` from the frame at `base` into a
+// freshly allocated PSRAM mosaic (dBZ+32 per pixel). Returns nullptr on a
+// memory shortfall or any transfer/decode failure — the caller keeps what it
+// had. No lock is held anywhere here.
+uint8_t* wxFetchMosaic(const String& base, const WxCover& cover) {
+  size_t mosaicBytes = static_cast<size_t>(cover.nx) * cover.ny * kWxTileSize *
+                       kWxTileSize;
+  // The TLS session lives on the internal heap; the tile PNG, the decoder
+  // and this mosaic in PSRAM. Leave headroom for the display copy too.
+  if (ESP.getFreeHeap() < 40 * 1024 ||
+      heap_caps_get_free_size(MALLOC_CAP_SPIRAM) <
+          mosaicBytes + kWxMaxPngBytes + sizeof(PNG) + 384 * 1024) {
+    rlog::Log.printf("[feeds] wx: memory low (heap %u KB, PSRAM %u KB); skip.\n",
+                  ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
+    return nullptr;
+  }
+  // The PNG decoder is ~48 KB of mostly inflate window — too big for the
+  // internal heap, so it lives in PSRAM, allocated once.
+  if (g_wxPng == nullptr) {
+    void* mem =
+        heap_caps_malloc(sizeof(PNG), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (mem == nullptr) return nullptr;
+    g_wxPng = new (mem) PNG();
+  }
+  uint8_t* cells = static_cast<uint8_t*>(
+      heap_caps_malloc(mosaicBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  uint8_t* pngBuf = static_cast<uint8_t*>(
+      heap_caps_malloc(kWxMaxPngBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (cells == nullptr || pngBuf == nullptr) {
+    heap_caps_free(cells);
+    heap_caps_free(pngBuf);
+    return nullptr;
+  }
+  memset(cells, 0, mosaicBytes);
+  WxDecodeCtx ctx;
+  ctx.mosaic = cells;
+  ctx.mosaicW = cover.nx * kWxTileSize;
+  WiFiClientSecure client;
+  client.setInsecure();  // TODO(security): install a CA bundle.
+  HTTPClient http;
+  http.setConnectTimeout(kHttpTimeoutMs);
+  http.setTimeout(kHttpTimeoutMs);
+  http.setUserAgent(kUserAgent);
+  http.setReuse(true);  // The tiles share one host (and TLS session).
+  bool ok = true;
+  for (int ty = 0; ty < cover.ny && ok; ++ty) {
+    for (int tx = 0; tx < cover.nx && ok; ++tx) {
+      // {size}/{z}/{x}/{y}/{color}/{smooth}_{snow}: unsmoothed, so pixels
+      // stay exact palette entries the table can match.
+      String url = base + "/" + String(kWxTileSize) + "/" + String(cover.z) +
+                   "/" + String(cover.x0 + tx) + "/" + String(cover.y0 + ty) +
+                   "/2/0_0.png";
+      ok = wxFetchTile(http, client, url, pngBuf, ctx, tx * kWxTileSize,
+                       ty * kWxTileSize);
+    }
+  }
+  heap_caps_free(pngBuf);
+  if (!ok) {
+    heap_caps_free(cells);
+    return nullptr;
+  }
+  return cells;
+}
+
+// Builds a cache entry for a fetched mosaic at the current cover.
+WxCacheEntry wxMakeEntry(time_t t, uint8_t* cells, const WxCover& cover) {
+  WxCacheEntry e;
+  e.time = t;
+  e.cells = cells;
+  e.width = static_cast<int16_t>(cover.nx * kWxTileSize);
+  e.height = static_cast<int16_t>(cover.ny * kWxTileSize);
+  e.zoom = cover.z;
+  e.originX = cover.x0 * kWxTileSize;
+  e.originY = cover.y0 * kWxTileSize;
+  return e;
+}
+
+// Copies a cached mosaic into a fresh buffer and swaps it into model.weather
+// (freeing the previous self-owned layer). The copy runs lock-free; only the
+// pointer swap is under the mutex.
+void wxPublish(model::Model& model, SemaphoreHandle_t mutex,
+               const WxCacheEntry& e) {
+  size_t bytes = static_cast<size_t>(e.width) * e.height;
+  uint8_t* copy = static_cast<uint8_t*>(
+      heap_caps_malloc(bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+  if (copy == nullptr) return;
+  memcpy(copy, e.cells, bytes);
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  heap_caps_free(model.weather.cells);
+  model.weather.cells = copy;
+  model.weather.width = e.width;
+  model.weather.height = e.height;
+  model.weather.zoom = e.zoom;
+  model.weather.originX = e.originX;
+  model.weather.originY = e.originY;
+  model.weather.fetchedMs = millis();
+  model.ui.wxFrameTime = e.time;
+  ++model.weather.generation;
+  xSemaphoreGive(mutex);
+  g_wxLoadedTime = e.time;
+}
+
 void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
   if (!WiFi.isConnected()) return;
 
-  // Snapshot the view and the time-scrub selection under the mutex: where
-  // the scope is looking, what the published layer already covers, and which
-  // frame the knob has selected.
+  // Snapshot the view, the display mode and the time-scrub selection.
   xSemaphoreTake(mutex, portMAX_DELAY);
   const model::Home& home = activeHome(model);
   float lat = home.latitude + model.ui.viewCenter.y / 60.0f;
@@ -1561,20 +1700,11 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
                                    (60.0f * cosf(home.latitude * DEG_TO_RAD));
   float range = model.ui.range;
   int offset = model.ui.wxOffsetSteps;
-  bool haveLayer = model.weather.cells != nullptr;
-  uint32_t fetchedMs = model.weather.fetchedMs;
-  WxCover loaded;
-  if (haveLayer) {
-    loaded.z = model.weather.zoom;
-    loaded.x0 = model.weather.originX / kWxTileSize;
-    loaded.y0 = model.weather.originY / kWxTileSize;
-    loaded.nx = static_cast<int8_t>(model.weather.width / kWxTileSize);
-    loaded.ny = static_cast<int8_t>(model.weather.height / kWxTileSize);
-  }
+  bool weatherMode = model.ui.display == model::DisplayMode::Weather;
   xSemaphoreGive(mutex);
 
-  // Refresh the frame index (cheap; cached between refreshes) so the scrub
-  // range and the selected frame are current, then resolve the selection.
+  // Refresh the frame index (cheap; cached between refreshes) and resolve the
+  // scrub range plus the selected frame.
   if (!refreshWxIndex()) return;
   time_t realNow = time(nullptr);
   bool synced = realNow > 1600000000;  // NTP has run.
@@ -1599,126 +1729,139 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
     selIdx = static_cast<int>(g_wxFrames.size()) - 1;
   }
   time_t selTime = g_wxFrames[selIdx].time;
-  String selBase = g_wxFrames[selIdx].base;
 
-  // Publish the scrub range and the selected frame's wall time right away —
-  // the on-scope clock's selected hand tracks the knob immediately, even
-  // while the matching tiles are still loading below.
-  xSemaphoreTake(mutex, portMAX_DELAY);
-  model.ui.wxStepsBack = stepsBack;
-  model.ui.wxStepsFwd = stepsFwd;
-  model.ui.wxFrameTime = selTime;
-  xSemaphoreGive(mutex);
-
-  // Decide whether a tile fetch is due at all: the refetch interval elapsed,
-  // the view wants a different tile cover and has settled on it (so a held
-  // zoom knob cannot queue a fetch per detent), or the selected time changed
-  // (a scrub). Failures back off.
-  WxCover want = wxCoverFor(lat, lon, range);
   uint32_t now = millis();
+  WxCover want = wxCoverFor(lat, lon, range);
   if (!wxCoverEq(want, g_wxWant)) {
     g_wxWant = want;
     g_wxWantMs = now;
   }
-  bool stale = !haveLayer || now - fetchedMs >= config::WEATHER_POLL_MS;
-  bool moved = haveLayer && !wxCoverEq(want, loaded) &&
-               now - g_wxWantMs >= kWxSettleMs;
-  bool timeChanged = selTime != g_wxLoadedTime;
-  if (!stale && !moved && !timeChanged) return;
-  if (g_wxLastTryMs != 0 && now - g_wxLastTryMs < kWxRetryMs) return;
-  g_wxLastTryMs = now;  // Cleared below if the cycle publishes.
 
-  // Do not start a cycle the heaps cannot absorb: the TLS session lives
-  // on the internal heap; the tile PNGs, the decoder state and both the
-  // old and new mosaics in PSRAM. Skipping a check is invisible.
-  size_t mosaicBytes = static_cast<size_t>(want.nx) * want.ny * kWxTileSize *
-                       kWxTileSize;
-  if (ESP.getFreeHeap() < 40 * 1024 ||
-      heap_caps_get_free_size(MALLOC_CAP_SPIRAM) <
-          mosaicBytes + kWxMaxPngBytes + sizeof(PNG) + 512 * 1024) {
-    Serial.printf("[feeds] wx: memory low (heap %u KB, PSRAM %u KB); skipping.\n",
-                  ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
-    return;
+  // Commit the cache to a cover on first use, or once the view settles on a
+  // different one (so a mid-pan doesn't thrash it). Dropping the cache never
+  // blanks the picture: model.weather is a self-owned copy that persists
+  // until a new frame is copied in.
+  bool needCover = !g_wxCacheCoverSet ||
+                   (!wxCoverEq(want, g_wxCacheCover) &&
+                    now - g_wxWantMs >= kWxSettleMs);
+  if (needCover) {
+    wxCacheClear();
+    g_wxCacheCover = want;
+    g_wxCacheCoverSet = true;
+    g_wxLoadedTime = 0;      // Force a republish for the new cover.
+    g_wxRevealed = false;    // Hold weather (acquiring) until the window fills.
+    g_wxFillStartMs = now;
   }
+  WxCover cover = g_wxCacheCover;
 
-  // The PNG decoder is ~48 KB of mostly inflate window — far too big for
-  // the internal heap, so it lives in PSRAM, allocated once.
-  if (g_wxPng == nullptr) {
-    void* mem =
-        heap_caps_malloc(sizeof(PNG), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (mem == nullptr) return;
-    g_wxPng = new (mem) PNG();
-  }
-
-  uint32_t started = millis();
-  uint8_t* cells = static_cast<uint8_t*>(
-      heap_caps_malloc(mosaicBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  uint8_t* pngBuf = static_cast<uint8_t*>(
-      heap_caps_malloc(kWxMaxPngBytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
-  if (cells == nullptr || pngBuf == nullptr) {
-    heap_caps_free(cells);
-    heap_caps_free(pngBuf);
-    return;
-  }
-  memset(cells, 0, mosaicBytes);
-
-  WxDecodeCtx ctx;
-  ctx.mosaic = cells;
-  ctx.mosaicW = want.nx * kWxTileSize;
-
-  WiFiClientSecure client;
-  // TODO(security): install a CA bundle and validate certificates.
-  client.setInsecure();
-  HTTPClient http;
-  http.setConnectTimeout(kHttpTimeoutMs);
-  http.setTimeout(kHttpTimeoutMs);
-  http.setUserAgent(kUserAgent);
-  http.setReuse(true);  // The tiles share one host (and TLS session).
-  bool ok = true;
-  for (int ty = 0; ty < want.ny && ok; ++ty) {
-    for (int tx = 0; tx < want.nx && ok; ++tx) {
-      // {size}/{z}/{x}/{y}/{color}/{smooth}_{snow}: unsmoothed, so pixels
-      // stay exact palette entries the table above can match.
-      String url = selBase + "/" + String(kWxTileSize) + "/" +
-                   String(want.z) + "/" + String(want.x0 + tx) + "/" +
-                   String(want.y0 + ty) + "/2/0_0.png";
-      ok = wxFetchTile(http, client, url, pngBuf, ctx, tx * kWxTileSize,
-                       ty * kWxTileSize);
+  // Drop cached frames that rolled out of the selectable window (e.g. a new
+  // now-frame arrived and the oldest aged past the rewind limit).
+  for (int i = static_cast<int>(g_wxCache.size()) - 1; i >= 0; --i) {
+    bool keep = false;
+    for (int j = g_wxNowIndex - stepsBack; j <= g_wxNowIndex + stepsFwd; ++j) {
+      if (j >= 0 && j < static_cast<int>(g_wxFrames.size()) &&
+          g_wxFrames[j].time == g_wxCache[i].time) {
+        keep = true;
+        break;
+      }
+    }
+    if (!keep) {
+      heap_caps_free(g_wxCache[i].cells);
+      g_wxCache.erase(g_wxCache.begin() + i);
     }
   }
-  heap_caps_free(pngBuf);
-  if (!ok) {
-    heap_caps_free(cells);
-    Serial.println("[feeds] wx: cycle failed; keeping last layer.");
-    return;
+
+  // A failed transfer backs off briefly so a bad frame doesn't hammer, but
+  // not so long that a scrub stalls.
+  bool canFetch = !(g_wxLastTryMs != 0 && now - g_wxLastTryMs < kWxRetryMs);
+
+  // 1) The frame under the knob is the priority: fetch it if it isn't cached.
+  int ci = wxCacheFind(selTime);
+  bool fetched = false;
+  if (ci < 0 && canFetch) {
+    uint32_t started = millis();
+    uint8_t* cells = wxFetchMosaic(g_wxFrames[selIdx].base, cover);
+    fetched = true;
+    if (cells != nullptr) {
+      g_wxLastTryMs = 0;
+      g_wxCache.push_back(wxMakeEntry(selTime, cells, cover));
+      ci = static_cast<int>(g_wxCache.size()) - 1;
+      rlog::Log.printf(
+          "[feeds] wx: @%ld cached (%lu ms, %u frames, PSRAM %u KB)\n",
+          static_cast<long>(selTime),
+          static_cast<unsigned long>(millis() - started),
+          static_cast<unsigned>(g_wxCache.size()), ESP.getFreePsram() / 1024);
+    } else {
+      g_wxLastTryMs = now;
+    }
   }
-  g_wxLastTryMs = 0;
 
-  // Publish under the mutex, briefly. The mosaic is georeferenced
-  // absolutely, so a home switched mid-fetch needs no invalidation — the
-  // switch only changes what the next cover check asks for.
+  (void)ci;  // The publish waits for the full window; see the reveal below.
+
+  // 2) Background fill (weather mode only): cache the nearest still-missing
+  // selectable frame, one per call, so the rest of the timeline is ready
+  // before the knob reaches it. Flights mode keeps only the live frame fresh.
+  if (weatherMode && !fetched && canFetch) {
+    int bestJ = -1, bestDist = 1 << 30;
+    for (int j = g_wxNowIndex - stepsBack; j <= g_wxNowIndex + stepsFwd; ++j) {
+      if (j < 0 || j >= static_cast<int>(g_wxFrames.size())) continue;
+      if (wxCacheFind(g_wxFrames[j].time) >= 0) continue;
+      int d = j > selIdx ? j - selIdx : selIdx - j;
+      if (d < bestDist) {
+        bestDist = d;
+        bestJ = j;
+      }
+    }
+    if (bestJ >= 0) {
+      uint32_t started = millis();
+      uint8_t* cells = wxFetchMosaic(g_wxFrames[bestJ].base, cover);
+      if (cells != nullptr) {
+        g_wxLastTryMs = 0;
+        g_wxCache.push_back(wxMakeEntry(g_wxFrames[bestJ].time, cells, cover));
+        rlog::Log.printf(
+            "[feeds] wx: prefetch @%ld (%lu ms, %u/%d frames, PSRAM %u KB)\n",
+            static_cast<long>(g_wxFrames[bestJ].time),
+            static_cast<unsigned long>(millis() - started),
+            static_cast<unsigned>(g_wxCache.size()),
+            stepsBack + stepsFwd + 1, ESP.getFreePsram() / 1024);
+      } else {
+        g_wxLastTryMs = now;
+      }
+    }
+  }
+
+  // Reveal weather only once every frame in the window is decoded, so the
+  // first scrub in any direction is instant — no visit-then-fetch. The reveal
+  // latches until the cover changes (a later rollover never drops back to
+  // acquiring), with a timeout so a flaky frame can't hold it up forever.
+  if (!g_wxRevealed) {
+    bool complete = true;
+    for (int j = g_wxNowIndex - stepsBack; j <= g_wxNowIndex + stepsFwd; ++j) {
+      if (j < 0 || j >= static_cast<int>(g_wxFrames.size())) continue;
+      if (wxCacheFind(g_wxFrames[j].time) < 0) {
+        complete = false;
+        break;
+      }
+    }
+    if (complete ||
+        now - g_wxFillStartMs > config::WEATHER_FILL_TIMEOUT_MS) {
+      g_wxRevealed = true;
+      rlog::Log.printf("[feeds] wx: window ready (%u frames, %s)\n",
+                    static_cast<unsigned>(g_wxCache.size()),
+                    complete ? "complete" : "timeout");
+    }
+  }
+
+  // Once revealed, show the selected frame and expose the scrub range; before
+  // that the range is zero, so the knob can't scrub onto an unbuffered frame.
+  int ci2 = wxCacheFind(selTime);
+  if (g_wxRevealed && ci2 >= 0 && selTime != g_wxLoadedTime) {
+    wxPublish(model, mutex, g_wxCache[ci2]);
+  }
   xSemaphoreTake(mutex, portMAX_DELAY);
-  heap_caps_free(model.weather.cells);
-  model.weather.cells = cells;
-  model.weather.width = static_cast<int16_t>(want.nx * kWxTileSize);
-  model.weather.height = static_cast<int16_t>(want.ny * kWxTileSize);
-  model.weather.zoom = want.z;
-  model.weather.originX = want.x0 * kWxTileSize;
-  model.weather.originY = want.y0 * kWxTileSize;
-  model.weather.fetchedMs = millis();
-  model.ui.wxFrameTime = selTime;  // The shown frame is now this one.
-  ++model.weather.generation;
+  model.ui.wxStepsBack = g_wxRevealed ? stepsBack : 0;
+  model.ui.wxStepsFwd = g_wxRevealed ? stepsFwd : 0;
   xSemaphoreGive(mutex);
-  g_wxLoadedTime = selTime;  // So a later scrub to another frame refetches.
-
-  Serial.printf(
-      "[feeds] wx: %dx%d tiles z%u @%ld published (%lu lit px, %lu unknown, "
-      "%lu ms, heap %u KB, PSRAM %u KB)\n",
-      want.nx, want.ny, want.z, static_cast<long>(selTime),
-      static_cast<unsigned long>(ctx.lit),
-      static_cast<unsigned long>(ctx.unknown),
-      static_cast<unsigned long>(millis() - started), ESP.getFreeHeap() / 1024,
-      ESP.getFreePsram() / 1024);
 }
 
 void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
@@ -1772,7 +1915,7 @@ void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
     }
     xSemaphoreGive(mutex);
     if (!still) {
-      Serial.println("[feeds] trace: follow changed mid-fetch; dropped.");
+      rlog::Log.println("[feeds] trace: follow changed mid-fetch; dropped.");
     }
     return;
   }
@@ -1827,7 +1970,7 @@ void pollDest(model::Model& model, SemaphoreHandle_t mutex) {
   if (!fetchDest(home, callsign, dest)) {
     g_destFailCallsign = callsign;
     g_destFailMs = millis();
-    Serial.printf("[feeds] dest: no route for %s.\n", callsign.c_str());
+    rlog::Log.printf("[feeds] dest: no route for %s.\n", callsign.c_str());
     return;
   }
 
@@ -1847,7 +1990,7 @@ void pollDest(model::Model& model, SemaphoreHandle_t mutex) {
   }
   xSemaphoreGive(mutex);
   if (still) {
-    Serial.printf("[feeds] dest: %s -> %.0f,%.0f NM from home.\n",
+    rlog::Log.printf("[feeds] dest: %s -> %.0f,%.0f NM from home.\n",
                   callsign.c_str(), dest.x, dest.y);
   }
 }

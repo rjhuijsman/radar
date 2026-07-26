@@ -78,7 +78,13 @@ constexpr int WEATHER_MAX_BACK_MIN = 55;          // Rewind cap in minutes.
 constexpr uint32_t WEATHER_SCRUB_IDLE_MS = 5000;  // Idle -> wind back to now.
 constexpr uint32_t WEATHER_SCRUB_WINDBACK_MS = 850;  // Hand sweep back to now.
 constexpr uint32_t WEATHER_CLOCK_FADE_MS = 700;   // Clock fade-out duration.
-constexpr uint32_t WEATHER_SCRUB_CHECK_MS = 400;  // Snappier fetch while scrubbing.
+// Weather reveals only once the whole scrub window is decoded (so the first
+// scrub is instant), unless this long passes first — a flaky frame then can't
+// hold the acquiring screen up forever; any gaps fetch on demand.
+constexpr uint32_t WEATHER_FILL_TIMEOUT_MS = 25000;
+constexpr uint32_t WEATHER_SCRUB_CHECK_MS = 150;  // Weather-mode poll: fast, so a
+                                                  // cached frame swaps in promptly
+                                                  // and the cache fills quickly.
 constexpr float DEFAULT_RANGE_NM = 40.0f;
 constexpr float MIN_RANGE_NM = 5.0f;
 constexpr float MAX_RANGE_NM = 240.0f;
