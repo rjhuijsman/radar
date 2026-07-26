@@ -47,6 +47,11 @@ constexpr uint16_t C_AMBER = rgb565(255, 194, 74);
 // City markers: a warm phosphor red, clearly apart from the cyan
 // basemap, the green traffic and the amber specials.
 constexpr uint16_t C_RED = rgb565(255, 88, 74);
+// The followed flight's onward path to its destination: a cool indigo,
+// clearly apart from the green/amber past-trail, the green traffic, the
+// amber specials, the cyan basemap and the red cities. Dim and dashed —
+// context ahead of the flight, not a headline.
+constexpr uint16_t C_DEST = rgb565(140, 132, 245);
 constexpr uint16_t C_WHITE = rgb565(233, 247, 240);
 constexpr uint16_t C_RING = rgb565(24, 96, 66);
 constexpr uint16_t C_TICK = rgb565(30, 120, 84);
@@ -883,6 +888,7 @@ struct StaticSig {
   uint8_t emph = 0;        // Range readout emphasized (recent zoom detent).
   uint32_t wxGen = 0;      // Weather layer generation, while it is drawn.
   int16_t trail = 0;       // Followed-flight trail length (grows as it flies).
+  uint8_t hasDest = 0;     // Followed flight's onward-path line drawn.
 };
 StaticSig g_sig;
 
@@ -936,7 +942,8 @@ bool sigEqual(const StaticSig& a, const StaticSig& b) {
   return a.range100 == b.range100 && a.cx == b.cx && a.cy == b.cy &&
          a.mode == b.mode && a.geo == b.geo && a.cities == b.cities &&
          a.bright == b.bright && a.online == b.online && a.home == b.home &&
-         a.emph == b.emph && a.wxGen == b.wxGen && a.trail == b.trail;
+         a.emph == b.emph && a.wxGen == b.wxGen && a.trail == b.trail &&
+         a.hasDest == b.hasDest;
 }
 
 StaticSig staticSigOf(const Model& model) {
@@ -963,6 +970,11 @@ StaticSig staticSigOf(const Model& model) {
     s.wxGen = model.weather.generation;
   }
   s.trail = static_cast<int16_t>(model.ui.followTrail.size());
+  // The onward-path line follows the same settle gate the draw uses, so
+  // the signature matches what is painted. A gradual change absorbed by
+  // the pipeline (not in sigUrgent), like the trail.
+  s.hasDest =
+      (model.ui.following && model.ui.followHasDest && g_viewSettled) ? 1 : 0;
   return s;
 }
 
@@ -1130,6 +1142,47 @@ void drawFollowTrail(Arduino_GFX* gfx, const Model& model) {
   }
 }
 
+// Draws a dashed line between two screen points: short strokes with gaps,
+// a texture distinct from the trail's dots. The endpoints arrive already
+// clipped to the panel box, so the raster stays in bounds.
+void drawDashedLine(Arduino_GFX* gfx, float x0, float y0, float x1, float y1,
+                    uint16_t color) {
+  constexpr float kDashPx = 8.0f;
+  constexpr float kGapPx = 7.0f;
+  float dx = x1 - x0, dy = y1 - y0;
+  float len = sqrtf(dx * dx + dy * dy);
+  if (len < 1.0f) return;
+  float ux = dx / len, uy = dy / len;
+  for (float s = 0.0f; s < len; s += kDashPx + kGapPx) {
+    float e = min(s + kDashPx, len);
+    gfx->drawLine(static_cast<int16_t>(x0 + ux * s),
+                  static_cast<int16_t>(y0 + uy * s),
+                  static_cast<int16_t>(x0 + ux * e),
+                  static_cast<int16_t>(y0 + uy * e), color);
+  }
+}
+
+// The followed flight's expected onward path: a dim dashed indigo line
+// from its current smoothed position out to its destination (when the
+// route is known). World-anchored like the trail — both endpoints go
+// through project() — so it pans and scales with the map, and it lives in
+// the static scene, which keeps it UNDER the per-frame velocity/heading
+// vector the dynamic pass draws over the reference. The destination is
+// often far outside the scope, so the segment is clipped to the panel box
+// (the geography clipper) before it is dashed.
+void drawFollowDest(Arduino_GFX* gfx, const Model& model) {
+  if (!model.ui.followHasDest) return;
+  int fi = model.ui.followIndex;
+  if (fi < 0 || fi >= static_cast<int>(model.aircraft.size())) return;
+  float x0, y0, x1, y1;
+  project(model, model.aircraft[fi].est, x0, y0);
+  project(model, model.ui.followDest, x1, y1);
+  uint8_t c0 = geoOutcode(x0, y0), c1 = geoOutcode(x1, y1);
+  if (!geoClipSegment(x0, y0, x1, y1, c0, c1)) return;  // Fully off-panel.
+  drawDashedLine(gfx, x0, y0, x1, y1,
+                 dim(C_DEST, model.ui.brightness * 0.6f));
+}
+
 // ---- Static-scene painter, resumable in time-budgeted slices. ----
 //
 // The scene is painted through a small unit machine so the follow-pan
@@ -1289,7 +1342,16 @@ bool buildRun(Model& model, uint32_t startUs, uint32_t budgetUs) {
         break;
       }
       case BuildStep::Trail:
-        if (model.ui.following) drawFollowTrail(gfx, model);
+        if (model.ui.following) {
+          // The destination line hides mid-pan like the geography and
+          // cities: it cannot scroll smoothly with the map through a
+          // follow switch, and hiding it there also keeps a just-left
+          // flight's route off the scope until the new target's is looked
+          // up. The dotted history trail keeps drawing (it is short and
+          // re-seeded per follow).
+          if (g_viewSettled) drawFollowDest(gfx, model);
+          drawFollowTrail(gfx, model);
+        }
         g_build.step = BuildStep::Labels;
         break;
       case BuildStep::Labels:

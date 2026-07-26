@@ -149,6 +149,9 @@ void networkTask(void*) {
     // The followed flight's historic trail: pollTrace paces itself and
     // fetches only when the follow target changes to a new aircraft.
     feeds::pollTrace(g_model, g_mutex);
+    // The followed flight's onward path: pollDest paces itself and looks
+    // up the destination only when the follow target changes.
+    feeds::pollDest(g_model, g_mutex);
     vTaskDelay(pdMS_TO_TICKS(20));
   }
 }

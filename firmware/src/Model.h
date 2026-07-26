@@ -166,6 +166,15 @@ struct Ui {
   String pausedFollow;           // Callsign to auto-resume following on return
                                  // to flights mode; set on entering weather,
                                  // cleared by a deliberate go-home. Empty=none.
+
+  Vec followDest;              // Destination of the followed flight, world NM
+                              // from home — the far end of its expected
+                              // onward path. Published by feeds::pollDest,
+                              // once per followed callsign.
+  bool followHasDest = false;  // followDest is known and belongs to the
+                               // current follow; false when the follow
+                               // changes or ends, or the route is unknown,
+                               // so no destination line is drawn.
 };
 
 // The whole shared world plus UI state.

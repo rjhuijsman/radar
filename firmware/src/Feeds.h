@@ -63,6 +63,19 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex);
 // loop. On any failure the live-only trail is left alone.
 void pollTrace(model::Model& model, SemaphoreHandle_t mutex);
 
+// Keeps the followed flight's onward-path destination current. When the
+// follow target changes to a new callsign, looks its route up once from
+// adsbdb, projects the destination airport's lat/lon around the active
+// home, and publishes it as model.ui.followDest (with followHasDest) for
+// the renderer to draw the expected onward path to. The route does not
+// change mid-flight, so it is fetched once per followed callsign and
+// reused. The lookup runs with no lock held; the mutex is taken only to
+// snapshot the target and to publish. A follow change clears the
+// destination promptly; an unknown callsign or a failed fetch leaves none
+// drawn (failures back off). Network-free and cheap otherwise, so it can
+// be called every loop.
+void pollDest(model::Model& model, SemaphoreHandle_t mutex);
+
 // Recomputes each POI's world position from its lat/lng relative to the
 // active home. Callers hold the model mutex. Call after loading config or
 // switching home.

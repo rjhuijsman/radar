@@ -718,6 +718,27 @@ String g_traceFailHex;      // Last hex whose fetch failed, for the backoff.
 uint32_t g_traceFailMs = 0;
 uint32_t g_traceCheckMs = 0;
 
+// ---- Followed-flight destination (adsbdb route). ----
+//
+// adsbdb answers a per-callsign route lookup with the flight's origin and
+// destination airports. When a flight is followed, pollDest looks that up
+// once and publishes the destination's projected world position as
+// model.ui.followDest, so the renderer can draw the expected onward path
+// to it. The route never changes mid-flight, so it is fetched once per
+// followed callsign and reused until the follow changes.
+
+// Dest tuning. The lookup is a small JSON body, so it round-trips through
+// httpGet as a String. Attempts are rate-limited, and a callsign adsbdb
+// has no route for backs off before being asked again.
+constexpr uint32_t kDestCheckMs = 1000;   // Lookup-attempt cadence.
+constexpr uint32_t kDestRetryMs = 60000;  // Refetch backoff after a failure.
+
+// Dest state, only ever touched from the network task.
+String g_destCallsign;      // Callsign the published destination belongs to.
+String g_destFailCallsign;  // Last callsign whose lookup failed, for backoff.
+uint32_t g_destFailMs = 0;
+uint32_t g_destCheckMs = 0;
+
 // True for a plain 6-character lower-case ICAO address. TIS-B and
 // anonymized targets ("~" prefix) have no trace file worth asking for.
 bool isIcaoHex(const String& hex) {
@@ -1056,8 +1077,37 @@ bool fetchTrace(const model::Home& home, const String& hex,
   return true;
 }
 
-// Thins `points` in place to `target`: an even spread that always keeps
-// the first and the last.
+// Looks up `callsign`'s route on adsbdb and projects its DESTINATION
+// airport around the active home, with NO lock held. The body is a few
+// hundred bytes, so the String round-trip through httpGet is fine.
+// Returns false when adsbdb does not know the callsign — an "unknown
+// callsign" answers with a response STRING in place of the route object,
+// so the destination lookups below simply resolve to null and fail — the
+// caller then draws no onward path. api.adsbdb.com needs no auth; TLS is
+// setInsecure() like the other feeds.
+bool fetchDest(const model::Home& home, const String& callsign,
+               model::Vec& out) {
+  if (!WiFi.isConnected()) return false;
+  String body;
+  if (!httpGet("https://api.adsbdb.com/v0/callsign/" + callsign, body)) {
+    return false;
+  }
+  static SpiRamAllocator allocator;
+  JsonDocument doc(&allocator);
+  if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
+  JsonVariantConst dest = doc["response"]["flightroute"]["destination"];
+  JsonVariantConst latV = dest["latitude"];
+  JsonVariantConst lonV = dest["longitude"];
+  if (latV.isNull() || lonV.isNull()) return false;
+  // as<float>() parses a numeric string too, in case the API ever quotes
+  // the coordinates; range-check guards a missing field that read as 0.
+  float lat = latV.as<float>();
+  float lon = lonV.as<float>();
+  if (fabsf(lat) > 90.0f || fabsf(lon) > 180.0f) return false;
+  out = geoToWorld(home, lat, lon);
+  return true;
+}
+
 }  // namespace
 
 bool pollTraffic(model::Model& model, SemaphoreHandle_t mutex) {
@@ -1649,6 +1699,76 @@ void pollTrace(model::Model& model, SemaphoreHandle_t mutex) {
   // Same target, already seeded: the renderer owns the trail from here — it
   // samples the live tail and its raised cap holds both the history and the
   // tail without eroding the seeded prefix — so there is nothing more to do.
+}
+
+void pollDest(model::Model& model, SemaphoreHandle_t mutex) {
+  // Snapshot the follow target and home under the mutex; the lookup below
+  // runs with no lock held. The target comparison runs on every call so a
+  // follow change drops the stale destination promptly, even though the
+  // HTTPS lookup itself is rate-limited.
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  model::Home home = activeHome(model);
+  bool following =
+      model.ui.following && model.ui.followIndex >= 0 &&
+      model.ui.followIndex < static_cast<int>(model.aircraft.size());
+  String callsign =
+      following ? model.aircraft[model.ui.followIndex].callsign : String();
+  bool hasDest = model.ui.followHasDest;
+  xSemaphoreGive(mutex);
+
+  // A different callsign than the published destination belongs to (the
+  // follow changed or ended): drop it so no stale onward path lingers, and
+  // reset the cache so the new target is looked up afresh. Only take the
+  // mutex when there is actually a published destination to clear.
+  if (callsign != g_destCallsign) {
+    if (hasDest) {
+      xSemaphoreTake(mutex, portMAX_DELAY);
+      model.ui.followHasDest = false;
+      xSemaphoreGive(mutex);
+    }
+    g_destCallsign = "";
+  }
+
+  if (!following || callsign.isEmpty()) return;  // Nothing to look up.
+  if (callsign == g_destCallsign) return;        // Already resolved.
+
+  // Rate-limit the lookups, and back off a callsign whose last lookup
+  // failed (an unknown route, a bad transfer) so a followed flight adsbdb
+  // has no route for is not queried every second.
+  uint32_t now = millis();
+  if (now - g_destCheckMs < kDestCheckMs) return;
+  g_destCheckMs = now;
+  if (callsign == g_destFailCallsign && now - g_destFailMs < kDestRetryMs) {
+    return;
+  }
+
+  model::Vec dest;
+  if (!fetchDest(home, callsign, dest)) {
+    g_destFailCallsign = callsign;
+    g_destFailMs = millis();
+    Serial.printf("[feeds] dest: no route for %s.\n", callsign.c_str());
+    return;
+  }
+
+  // Publish under the mutex, briefly. Bail if the follow moved on (or the
+  // home switched) while the lookup ran — the projected point would be for
+  // the wrong flight or the wrong origin.
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  bool still =
+      model.ui.following && model.ui.followIndex >= 0 &&
+      model.ui.followIndex < static_cast<int>(model.aircraft.size()) &&
+      model.aircraft[model.ui.followIndex].callsign == callsign &&
+      activeHome(model).name == home.name;
+  if (still) {
+    model.ui.followDest = dest;
+    model.ui.followHasDest = true;
+    g_destCallsign = callsign;
+  }
+  xSemaphoreGive(mutex);
+  if (still) {
+    Serial.printf("[feeds] dest: %s -> %.0f,%.0f NM from home.\n",
+                  callsign.c_str(), dest.x, dest.y);
+  }
 }
 
 void reprojectStatics(model::Model& model) {
