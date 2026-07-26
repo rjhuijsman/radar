@@ -118,8 +118,48 @@ std::vector<int> browseOrder(const Model& model) {
   return order;
 }
 
+// One detent turn in weather mode: step the radar layer through time. CW
+// (direction > 0) moves forward toward now (and the nowcast when RainViewer
+// serves one), CCW back into the past. Clamped to the range feeds publishes;
+// a turn with nothing loaded to scrub is ignored so the clock never shows a
+// dead dial.
+void weatherScrub(Model& model, int direction) {
+  int lo = -model.ui.wxStepsBack;
+  int hi = model.ui.wxStepsFwd;
+  if (lo == 0 && hi == 0) return;  // No frames known yet; nothing to scrub.
+  int next = model.ui.wxOffsetSteps + direction;
+  if (next < lo) next = lo;
+  if (next > hi) next = hi;
+  model.ui.wxOffsetSteps = next;
+  model.ui.wxScrubMs = millis();
+  model.ui.wxScrubbing = true;
+}
+
+// Runs the weather-scrub lifecycle each poll: after the idle timeout the
+// selection snaps back to the live frame, and once the clock has faded the
+// overlay is released. Leaving weather mode drops it at once.
+void weatherScrubTick(Model& model) {
+  if (!model.ui.wxScrubbing) return;
+  if (model.ui.display != DisplayMode::Weather) {
+    model.ui.wxScrubbing = false;
+    model.ui.wxOffsetSteps = 0;
+    return;
+  }
+  uint32_t age = millis() - model.ui.wxScrubMs;
+  if (age >= config::WEATHER_SCRUB_IDLE_MS) {
+    model.ui.wxOffsetSteps = 0;  // Back to the live frame.
+    if (age >= config::WEATHER_SCRUB_IDLE_MS + config::WEATHER_CLOCK_FADE_MS) {
+      model.ui.wxScrubbing = false;  // Clock has faded; release the overlay.
+    }
+  }
+}
+
 // One detent turn while browsing (encoder not held).
 void rotarySelect(Model& model, int direction) {
+  if (model.ui.display == DisplayMode::Weather) {
+    weatherScrub(model, direction);  // Weather mode: the knob scrubs time.
+    return;
+  }
   if (!model.ui.following) {
     std::vector<int> list = {-1};  // -1 = no target selected.
     for (int i : browseOrder(model)) list.push_back(i);
@@ -202,6 +242,10 @@ void readToggles(Model& model) {
   // Note only on an actual change, so it does not spam the poll.
   if (display != model.ui.display) {
     model.ui.display = display;
+    // Entering weather repurposes the knob for time-scrub, so drop any
+    // pending flights-mode browse selection (a stale press would otherwise
+    // start following in weather mode).
+    if (display == DisplayMode::Weather) model.ui.browseSel = -1;
     if (display == DisplayMode::Weather && model.ui.following) {
       // Weather pauses tracking: remember the flight and let the map freeze
       // in place. Returning to flights resumes it (unless the user goes home
@@ -309,6 +353,7 @@ void poll(Model& model) {
   readKnob(model);
   readToggles(model);
   readLight(model);
+  weatherScrubTick(model);
 
   // Browse selections expire: with a hundred live targets a turn always
   // lands on one, so without this the press-at-base home switch would be

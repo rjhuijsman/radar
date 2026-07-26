@@ -177,6 +177,20 @@ struct Ui {
                                // current follow; false when the follow
                                // changes or ends, or the route is unknown,
                                // so no destination line is drawn.
+
+  // Weather time-scrub. In weather mode the knob steps the RainViewer layer
+  // through time: 0 is the latest ("now") frame, negative steps into the
+  // past (10 min each), positive into the nowcast when RainViewer serves it.
+  // Inputs writes wxOffsetSteps (clamped to the range feeds publishes) and
+  // stamps wxScrubMs on each detent; feeds publishes how far each way is
+  // available and wxFrameTime, the wall time of the frame actually shown,
+  // which the on-scope clock's selected hand reads.
+  int wxOffsetSteps = 0;      // Selected offset from now, in 10-min frames.
+  int wxStepsBack = 0;        // Past frames available to scrub to (feeds).
+  int wxStepsFwd = 0;         // Nowcast frames available (feeds).
+  time_t wxFrameTime = 0;     // Wall time of the shown weather frame; 0=none.
+  uint32_t wxScrubMs = 0;     // millis() of the last time-scrub detent.
+  bool wxScrubbing = false;   // Clock overlay up (scrubbing, or fading out).
 };
 
 // The whole shared world plus UI state.

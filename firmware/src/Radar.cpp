@@ -3,6 +3,7 @@
 #include <esp_heap_caps.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #include <algorithm>
 #include <utility>
@@ -904,6 +905,59 @@ void drawToggleFlash(Arduino_GFX* gfx, const Model& model) {
   gfx->print(text);
 }
 
+// The weather time-scrub clock: an analog face drawn inside the innermost
+// range ring (its edge is the clock's rim) while the knob is scrubbing time.
+// 12/3/6/9 sit on the rim; a dim hand marks the real "now", and a brighter
+// amber hand marks the selected frame's time — the angle between them is how
+// far back (or forward) the scrub has gone. Minute hand only: the scrub never
+// spans an hour, so it never wraps. `alpha` fades the whole overlay in and
+// out. Drawn inside a tracked span so the dirty-rect system erases it clean.
+void drawWeatherClock(Arduino_GFX* gfx, const Model& model, float alpha) {
+  time_t nowT = time(nullptr);
+  if (nowT < 1600000000) return;  // NTP has not run: no meaningful clock.
+  float k = model.ui.brightness * alpha;
+  float R = kRadius / 4.0f;  // Innermost ring radius = the clock face.
+  int cx = static_cast<int>(kCenterX);
+  int cy = static_cast<int>(kCenterY);
+
+  // 12 / 3 / 6 / 9 numerals just inside the rim.
+  uint16_t face = dim(C_CYAN, k * 0.6f);
+  gfx->setTextSize(1);
+  gfx->setTextColor(face);
+  const char* labels[4] = {"12", "3", "6", "9"};
+  const int labelAng[4] = {0, 90, 180, 270};
+  for (int i = 0; i < 4; ++i) {
+    float x, y;
+    polar(labelAng[i], R - 13, x, y);
+    int w = static_cast<int>(strlen(labels[i])) * 6;
+    gfx->setCursor(static_cast<int>(x) - w / 2, static_cast<int>(y) - 4);
+    gfx->print(labels[i]);
+  }
+
+  // Now hand: the real wall clock, dim and short — the fixed reference.
+  float nowAng = (nowT % 3600) / 3600.0f * 360.0f;
+  float nx, ny;
+  polar(nowAng, R * 0.58f, nx, ny);
+  gfx->drawLine(cx, cy, static_cast<int>(nx), static_cast<int>(ny),
+                dim(C_WHITE, k * 0.7f));
+
+  // Selected hand: the shown frame, bright amber and longer — this is what
+  // the knob moves. A slim triangular wedge reads more clearly than a hair
+  // line at this size.
+  time_t selT = model.ui.wxFrameTime > 0 ? model.ui.wxFrameTime : nowT;
+  float selAng = (selT % 3600) / 3600.0f * 360.0f;
+  uint16_t sel = dim(C_AMBER, k);
+  float tipX, tipY, baseAX, baseAY, baseBX, baseBY;
+  polar(selAng, R * 0.86f, tipX, tipY);
+  polar(selAng + 90.0f, 3.0f, baseAX, baseAY);
+  polar(selAng - 90.0f, 3.0f, baseBX, baseBY);
+  gfx->fillTriangle(static_cast<int>(tipX), static_cast<int>(tipY),
+                    static_cast<int>(baseAX), static_cast<int>(baseAY),
+                    static_cast<int>(baseBX), static_cast<int>(baseBY), sel);
+
+  gfx->fillCircle(cx, cy, 3, sel);  // Hub.
+}
+
 // ---- Incremental (dirty-rect) renderer, double-buffered. ----
 //
 // The static reference holds the unchanging scene (background, rings, weather,
@@ -1538,7 +1592,7 @@ void pipeCancel() { g_pipe = Pipe::Idle; }
 // One entry of the frame's desired-element list, in draw (z) order:
 // the sweep sits under the markers, which sit under the aircraft and
 // the overlays, exactly as the original full-redraw pass drew them.
-enum class EKind : uint8_t { Home, Poi, Aircraft, Flash, Signal };
+enum class EKind : uint8_t { Home, Poi, Aircraft, Flash, Signal, Clock };
 
 struct Desired {
   uint32_t id;    // Stable identity, ascending in list order.
@@ -1699,6 +1753,14 @@ void computeDesired(const Model& model) {
     g_desired.push_back(
         Desired{0x30000002u, ++g_seq, EKind::Signal, 0, -1, false});
   }
+
+  // The weather time-scrub clock: shown over the dial while scrubbing (and
+  // fading out after), once there is a radar image under it. Always redraws
+  // (it animates: the fade, and the now hand ticks with the wall clock).
+  if (showWeather(model) && model.ui.wxScrubbing && ready) {
+    g_desired.push_back(
+        Desired{0x30000003u, ++g_seq, EKind::Clock, 0, -1, false});
+  }
 }
 
 // Draws one desired element into the live surface and captures its
@@ -1734,6 +1796,20 @@ void drawElem(Model& model, const Desired& d, Elem& out) {
       if (fade > 0.0f) {
         g_live->beginTrack();
         drawAcquiringSignal(g_live, model, fade);
+        endTrackPush();
+      }
+      break;
+    }
+    case EKind::Clock: {
+      uint32_t age = millis() - model.ui.wxScrubMs;
+      float alpha = 1.0f;
+      if (age >= config::WEATHER_SCRUB_IDLE_MS) {
+        alpha = 1.0f - (age - config::WEATHER_SCRUB_IDLE_MS) /
+                           static_cast<float>(config::WEATHER_CLOCK_FADE_MS);
+      }
+      if (alpha > 0.0f) {
+        g_live->beginTrack();
+        drawWeatherClock(g_live, model, alpha);
         endTrackPush();
       }
       break;

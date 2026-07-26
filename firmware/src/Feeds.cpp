@@ -600,27 +600,44 @@ int wxPngLine(PNGDRAW* pDraw) {
   return 1;
 }
 
+// One selectable RainViewer frame: its wall time and the host+path base the
+// tile URLs hang off. The frame list runs oldest-past .. newest-past, then
+// any nowcast; g_wxNowIndex marks the newest past ("now").
+struct WxFrame {
+  time_t time;
+  String base;
+};
+
 // Weather fetch state, only ever touched from the network task.
-String g_wxTileBase;        // host+path of the newest frame, from the index.
+std::vector<WxFrame> g_wxFrames;  // Selectable frames (past then nowcast).
+int g_wxNowIndex = -1;      // Index of the newest past frame ("now").
 uint32_t g_wxIndexMs = 0;   // When the index was last fetched (0 = never).
 uint32_t g_wxLastTryMs = 0; // Last attempt that did not publish (backoff).
+time_t g_wxLoadedTime = 0;  // Wall time of the frame the published layer holds.
 PNG* g_wxPng = nullptr;     // PNGdec instance; ~48 KB, so it lives in PSRAM.
 WxCover g_wxWant;           // Last desired cover, for the settle debounce.
 uint32_t g_wxWantMs = 0;
 
-// Fetches the RainViewer frame index and caches the newest past frame's
-// tile base URL. The index is a couple of hundred bytes of JSON, so the
-// String round-trip through httpGet is fine.
+// How many past frames to retain for scrubbing: the knob rewinds at most an
+// hour (WEATHER_MAX_BACK_MIN), so eight 10-minute frames is comfortably
+// enough; keeping the list short bounds the String memory.
+constexpr size_t kWxKeepPast = 8;
+
+// Fetches the RainViewer frame index and rebuilds the selectable-frame list:
+// the recent past frames (capped) plus any nowcast. The index is a couple of
+// hundred bytes of JSON, so the String round-trip through httpGet is fine.
+// Cached for WEATHER_POLL_MS, so calling it every check is a cheap early
+// return between refreshes.
 bool refreshWxIndex() {
-  if (!g_wxTileBase.isEmpty() &&
+  if (!g_wxFrames.empty() &&
       millis() - g_wxIndexMs < config::WEATHER_POLL_MS) {
     return true;
   }
   String body;
   if (!httpGet("https://api.rainviewer.com/public/weather-maps.json", body)) {
     Serial.println("[feeds] wx: index fetch failed.");
-    // A previously fetched frame stays valid for a while; reuse it.
-    return !g_wxTileBase.isEmpty();
+    // A previously fetched frame set stays valid for a while; reuse it.
+    return !g_wxFrames.empty();
   }
   static SpiRamAllocator allocator;
   JsonDocument doc(&allocator);
@@ -631,9 +648,25 @@ bool refreshWxIndex() {
     Serial.println("[feeds] wx: index has no radar frames.");
     return false;
   }
-  const char* path = past[past.size() - 1]["path"];
-  if (path == nullptr) return false;
-  g_wxTileBase = String(host) + path;
+  std::vector<WxFrame> frames;
+  size_t start = past.size() > kWxKeepPast ? past.size() - kWxKeepPast : 0;
+  for (size_t i = start; i < past.size(); ++i) {
+    time_t t = past[i]["time"].as<long>();
+    const char* p = past[i]["path"];
+    if (p == nullptr || t == 0) continue;
+    frames.push_back({t, String(host) + p});
+  }
+  if (frames.empty()) return false;
+  int nowIdx = static_cast<int>(frames.size()) - 1;  // Newest past = "now".
+  JsonArrayConst nowcast = doc["radar"]["nowcast"].as<JsonArrayConst>();
+  for (JsonVariantConst f : nowcast) {
+    time_t t = f["time"].as<long>();
+    const char* p = f["path"];
+    if (p == nullptr || t == 0) continue;
+    frames.push_back({t, String(host) + p});
+  }
+  g_wxFrames = std::move(frames);
+  g_wxNowIndex = nowIdx;
   g_wxIndexMs = millis();
   return true;
 }
@@ -1518,14 +1551,16 @@ int pollIcal(model::Model& model, SemaphoreHandle_t mutex) {
 void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
   if (!WiFi.isConnected()) return;
 
-  // Snapshot the view under the mutex: where the scope is looking, and
-  // what the published layer already covers.
+  // Snapshot the view and the time-scrub selection under the mutex: where
+  // the scope is looking, what the published layer already covers, and which
+  // frame the knob has selected.
   xSemaphoreTake(mutex, portMAX_DELAY);
   const model::Home& home = activeHome(model);
   float lat = home.latitude + model.ui.viewCenter.y / 60.0f;
   float lon = home.longitude + model.ui.viewCenter.x /
                                    (60.0f * cosf(home.latitude * DEG_TO_RAD));
   float range = model.ui.range;
+  int offset = model.ui.wxOffsetSteps;
   bool haveLayer = model.weather.cells != nullptr;
   uint32_t fetchedMs = model.weather.fetchedMs;
   WxCover loaded;
@@ -1538,9 +1573,47 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
   }
   xSemaphoreGive(mutex);
 
-  // Decide whether a fetch is due at all: the refetch interval elapsed,
-  // or the view wants a different tile cover and has settled on it (so a
-  // held zoom knob cannot queue a fetch per detent). Failures back off.
+  // Refresh the frame index (cheap; cached between refreshes) so the scrub
+  // range and the selected frame are current, then resolve the selection.
+  if (!refreshWxIndex()) return;
+  time_t realNow = time(nullptr);
+  bool synced = realNow > 1600000000;  // NTP has run.
+  int stepsBack = 0;
+  if (synced) {
+    for (int i = g_wxNowIndex - 1; i >= 0; --i) {
+      if (realNow - g_wxFrames[i].time <=
+          static_cast<time_t>(config::WEATHER_MAX_BACK_MIN) * 60) {
+        ++stepsBack;
+      } else {
+        break;
+      }
+    }
+  } else {
+    stepsBack = g_wxNowIndex > 0 ? g_wxNowIndex : 0;
+  }
+  int stepsFwd = static_cast<int>(g_wxFrames.size()) - 1 - g_wxNowIndex;
+  if (stepsFwd < 0) stepsFwd = 0;
+  int selIdx = g_wxNowIndex + offset;
+  if (selIdx < 0) selIdx = 0;
+  if (selIdx >= static_cast<int>(g_wxFrames.size())) {
+    selIdx = static_cast<int>(g_wxFrames.size()) - 1;
+  }
+  time_t selTime = g_wxFrames[selIdx].time;
+  String selBase = g_wxFrames[selIdx].base;
+
+  // Publish the scrub range and the selected frame's wall time right away —
+  // the on-scope clock's selected hand tracks the knob immediately, even
+  // while the matching tiles are still loading below.
+  xSemaphoreTake(mutex, portMAX_DELAY);
+  model.ui.wxStepsBack = stepsBack;
+  model.ui.wxStepsFwd = stepsFwd;
+  model.ui.wxFrameTime = selTime;
+  xSemaphoreGive(mutex);
+
+  // Decide whether a tile fetch is due at all: the refetch interval elapsed,
+  // the view wants a different tile cover and has settled on it (so a held
+  // zoom knob cannot queue a fetch per detent), or the selected time changed
+  // (a scrub). Failures back off.
   WxCover want = wxCoverFor(lat, lon, range);
   uint32_t now = millis();
   if (!wxCoverEq(want, g_wxWant)) {
@@ -1550,7 +1623,8 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
   bool stale = !haveLayer || now - fetchedMs >= config::WEATHER_POLL_MS;
   bool moved = haveLayer && !wxCoverEq(want, loaded) &&
                now - g_wxWantMs >= kWxSettleMs;
-  if (!stale && !moved) return;
+  bool timeChanged = selTime != g_wxLoadedTime;
+  if (!stale && !moved && !timeChanged) return;
   if (g_wxLastTryMs != 0 && now - g_wxLastTryMs < kWxRetryMs) return;
   g_wxLastTryMs = now;  // Cleared below if the cycle publishes.
 
@@ -1566,7 +1640,6 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
                   ESP.getFreeHeap() / 1024, ESP.getFreePsram() / 1024);
     return;
   }
-  if (!refreshWxIndex()) return;
 
   // The PNG decoder is ~48 KB of mostly inflate window — far too big for
   // the internal heap, so it lives in PSRAM, allocated once.
@@ -1606,7 +1679,7 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
     for (int tx = 0; tx < want.nx && ok; ++tx) {
       // {size}/{z}/{x}/{y}/{color}/{smooth}_{snow}: unsmoothed, so pixels
       // stay exact palette entries the table above can match.
-      String url = g_wxTileBase + "/" + String(kWxTileSize) + "/" +
+      String url = selBase + "/" + String(kWxTileSize) + "/" +
                    String(want.z) + "/" + String(want.x0 + tx) + "/" +
                    String(want.y0 + ty) + "/2/0_0.png";
       ok = wxFetchTile(http, client, url, pngBuf, ctx, tx * kWxTileSize,
@@ -1633,13 +1706,16 @@ void pollWeather(model::Model& model, SemaphoreHandle_t mutex) {
   model.weather.originX = want.x0 * kWxTileSize;
   model.weather.originY = want.y0 * kWxTileSize;
   model.weather.fetchedMs = millis();
+  model.ui.wxFrameTime = selTime;  // The shown frame is now this one.
   ++model.weather.generation;
   xSemaphoreGive(mutex);
+  g_wxLoadedTime = selTime;  // So a later scrub to another frame refetches.
 
   Serial.printf(
-      "[feeds] wx: %dx%d tiles z%u published (%lu lit px, %lu unknown, "
+      "[feeds] wx: %dx%d tiles z%u @%ld published (%lu lit px, %lu unknown, "
       "%lu ms, heap %u KB, PSRAM %u KB)\n",
-      want.nx, want.ny, want.z, static_cast<unsigned long>(ctx.lit),
+      want.nx, want.ny, want.z, static_cast<long>(selTime),
+      static_cast<unsigned long>(ctx.lit),
       static_cast<unsigned long>(ctx.unknown),
       static_cast<unsigned long>(millis() - started), ESP.getFreeHeap() / 1024,
       ESP.getFreePsram() / 1024);
