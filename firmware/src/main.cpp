@@ -131,13 +131,19 @@ void networkTask(void*) {
     bool adsbDue = false;
     bool weatherMode = false;
     xSemaphoreTake(g_mutex, portMAX_DELAY);
-    if (g_model.adsbPollDue) {
+    weatherMode = g_model.ui.display == model::DisplayMode::Weather;
+    // In weather mode the flights layer is hidden, so the traffic poll — which
+    // can block this single network task for many seconds (global special
+    // lookups) — is skipped entirely; it must not stall the weather task,
+    // which has to stay responsive for time-scrubbing. The pending request is
+    // left set, so switching back to flights repolls at once.
+    if (!weatherMode && g_model.adsbPollDue) {
       g_model.adsbPollDue = false;
       adsbDue = true;
     }
-    weatherMode = g_model.ui.display == model::DisplayMode::Weather;
     xSemaphoreGive(g_mutex);
-    if (adsbDue || now - lastAdsb >= 2 * config::ADSB_POLL_MS) {
+    if (!weatherMode &&
+        (adsbDue || now - lastAdsb >= 2 * config::ADSB_POLL_MS)) {
       lastAdsb = now;
       feeds::pollTraffic(g_model, g_mutex);
     }
